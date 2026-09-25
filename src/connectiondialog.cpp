@@ -1,0 +1,129 @@
+#include "connectiondialog.h"
+#include <QVBoxLayout>
+#include <QFormLayout>
+#include <QHBoxLayout>
+#include <QFileDialog>
+#include <QDir>
+
+ConnectionDialog::ConnectionDialog(QWidget *parent)
+    : QDialog(parent)
+{
+    setupUi();
+    setupConnections();
+}
+
+ConnectionDialog::~ConnectionDialog()
+{
+}
+
+void ConnectionDialog::setupUi()
+{
+    setWindowTitle("Настройки подключения");
+    resize(400, 280);
+
+    QVBoxLayout *mainLayout = new QVBoxLayout(this);
+    QFormLayout *formLayout = new QFormLayout();
+
+    // Имя подключения
+    nameEdit = new QLineEdit(this);
+    nameEdit->setPlaceholderText("Например: Мой сервер");
+    formLayout->addRow("Имя:", nameEdit);
+
+    // Хост
+    hostEdit = new QLineEdit(this);
+    hostEdit->setPlaceholderText("IP-адрес или домен");
+    formLayout->addRow("Хост:", hostEdit);
+
+    // Порт
+    portSpinBox = new QSpinBox(this);
+    portSpinBox->setRange(1, 65535);
+    portSpinBox->setValue(22);
+    formLayout->addRow("Порт:", portSpinBox);
+
+    // Логин
+    loginEdit = new QLineEdit(this);
+    loginEdit->setPlaceholderText("Имя пользователя");
+    formLayout->addRow("Логин:", loginEdit);
+
+    // Пароль
+    passwordEdit = new QLineEdit(this);
+    passwordEdit->setEchoMode(QLineEdit::Password);
+    passwordEdit->setPlaceholderText("Пароль (сохранится в защищенном хранилище)");
+    formLayout->addRow("Пароль:", passwordEdit);
+
+    // Чекбокс использования ключа
+    useKeyCheckBox = new QCheckBox("Использовать приватный ключ SSH", this);
+    formLayout->addRow(useKeyCheckBox);
+
+    // Путь к ключу + кнопка Обзор
+    QHBoxLayout *keyLayout = new QHBoxLayout();
+    keyPathEdit = new QLineEdit(this);
+    keyPathEdit->setPlaceholderText("Путь к файлу ключа");
+    keyPathEdit->setEnabled(false);
+    
+    browseKeyButton = new QPushButton("Обзор", this);
+    browseKeyButton->setEnabled(false);
+    
+    keyLayout->addWidget(keyPathEdit);
+    keyLayout->addWidget(browseKeyButton);
+    
+    formLayout->addRow("Ключ:", keyLayout);
+
+    mainLayout->addLayout(formLayout);
+
+    // Кнопки ОК и Отмена
+    buttonBox = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, this);
+    mainLayout->addWidget(buttonBox);
+}
+
+void ConnectionDialog::setupConnections()
+{
+    connect(buttonBox, &QDialogButtonBox::accepted, this, &QDialog::accept);
+    connect(buttonBox, &QDialogButtonBox::rejected, this, &QDialog::reject);
+
+    // Переключение полей при изменении чекбокса
+    connect(useKeyCheckBox, &QCheckBox::toggled, passwordEdit, &QLineEdit::setDisabled);
+    connect(useKeyCheckBox, &QCheckBox::toggled, keyPathEdit, &QLineEdit::setEnabled);
+    connect(useKeyCheckBox, &QCheckBox::toggled, browseKeyButton, &QPushButton::setEnabled);
+
+    // Клик по кнопке "Обзор"
+    connect(browseKeyButton, &QPushButton::clicked, this, &ConnectionDialog::onBrowseKey);
+}
+
+void ConnectionDialog::onBrowseKey()
+{
+    QString fileName = QFileDialog::getOpenFileName(
+        this,
+        "Выберите приватный ключ SSH",
+        QDir::homePath() + "/.ssh",
+        "Все файлы (*)"
+    );
+
+    if (!fileName.isEmpty()) {
+        keyPathEdit->setText(fileName);
+    }
+}
+
+void ConnectionDialog::setConnection(const Connection &connection)
+{
+    nameEdit->setText(connection.getName());
+    hostEdit->setText(connection.getHost());
+    portSpinBox->setValue(connection.getPort());
+    loginEdit->setText(connection.getLogin());
+    passwordEdit->setText(connection.getPassword());
+    useKeyCheckBox->setChecked(connection.getUseKey());
+    keyPathEdit->setText(connection.getPrivateKeyPath());
+}
+
+Connection ConnectionDialog::getConnection() const
+{
+    Connection conn;
+    conn.setName(nameEdit->text());
+    conn.setHost(hostEdit->text());
+    conn.setPort(portSpinBox->value());
+    conn.setLogin(loginEdit->text());
+    conn.setPassword(passwordEdit->text());
+    conn.setUseKey(useKeyCheckBox->isChecked());
+    conn.setPrivateKeyPath(keyPathEdit->text());
+    return conn;
+}

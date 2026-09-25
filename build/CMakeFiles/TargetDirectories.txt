@@ -1,0 +1,5 @@
+/home/hellhost/Projects/LinuxXterm/build/CMakeFiles/linuxxterm.dir
+/home/hellhost/Projects/LinuxXterm/build/CMakeFiles/edit_cache.dir
+/home/hellhost/Projects/LinuxXterm/build/CMakeFiles/rebuild_cache.dir
+/home/hellhost/Projects/LinuxXterm/build/CMakeFiles/linuxxterm_autogen_timestamp_deps.dir
+/home/hellhost/Projects/LinuxXterm/build/CMakeFiles/linuxxterm_autogen.dir

@@ -1,0 +1,7 @@
+{
+	"InstallScripts" : 
+	[
+		"/home/hellhost/Projects/LinuxXterm/build/cmake_install.cmake"
+	],
+	"Parallel" : false
+}
