@@ -21,6 +21,7 @@ public:
     QString getPassword() const;
     QString getPrivateKeyPath() const;
     bool getUseKey() const;
+    bool getAllowLegacyHostKeys() const;
 
     // Сеттеры
     void setId(const QString &id);
@@ -31,6 +32,7 @@ public:
     void setPassword(const QString &password);
     void setPrivateKeyPath(const QString &path);
     void setUseKey(bool useKey);
+    void setAllowLegacyHostKeys(bool allow);
 
     // Сериализация в JSON (пароль теперь НЕ шифруем!)
     QJsonObject toJson() const;
@@ -45,6 +47,7 @@ private:
     QString m_password;  // Теперь хранится в открытом виде (используется только для передачи в PasswordManager)
     QString m_privateKeyPath;
     bool m_useKey;
+    bool m_allowLegacyHostKeys;
 
     static QString generateId();
 };

@@ -19,7 +19,7 @@ ConnectionDialog::~ConnectionDialog()
 void ConnectionDialog::setupUi()
 {
     setWindowTitle("Настройки подключения");
-    resize(400, 280);
+    resize(440, 330);
 
     QVBoxLayout *mainLayout = new QVBoxLayout(this);
     QFormLayout *formLayout = new QFormLayout();
@@ -69,6 +69,13 @@ void ConnectionDialog::setupUi()
     
     formLayout->addRow("Ключ:", keyLayout);
 
+    allowLegacyHostKeysCheckBox =
+        new QCheckBox("Совместимость со старым SSH-сервером (например, RHEL 6)", this);
+    allowLegacyHostKeysCheckBox->setToolTip(
+        "Только для этого профиля разрешаются старые алгоритмы SSH (ssh-rsa, SHA-1 KEX/MAC и CBC). "
+        "Используйте только для доверенных серверов. ssh-dss не поддерживается современным OpenSSH.");
+    formLayout->addRow(allowLegacyHostKeysCheckBox);
+
     mainLayout->addLayout(formLayout);
 
     // Кнопки ОК и Отмена
@@ -112,6 +119,7 @@ void ConnectionDialog::setConnection(const Connection &connection)
     loginEdit->setText(connection.getLogin());
     passwordEdit->setText(connection.getPassword());
     useKeyCheckBox->setChecked(connection.getUseKey());
+    allowLegacyHostKeysCheckBox->setChecked(connection.getAllowLegacyHostKeys());
     keyPathEdit->setText(connection.getPrivateKeyPath());
 }
 
@@ -125,5 +133,6 @@ Connection ConnectionDialog::getConnection() const
     conn.setPassword(passwordEdit->text());
     conn.setUseKey(useKeyCheckBox->isChecked());
     conn.setPrivateKeyPath(keyPathEdit->text());
+    conn.setAllowLegacyHostKeys(allowLegacyHostKeysCheckBox->isChecked());
     return conn;
 }

@@ -1,2 +1,0 @@
-set(__QT_DEPLOY_TARGET_linuxxterm_FILE /home/hellhost/Projects/LinuxXterm/build/linuxxterm)
-set(__QT_DEPLOY_TARGET_linuxxterm_TYPE EXECUTABLE)

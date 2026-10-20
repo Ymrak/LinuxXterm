@@ -1,0 +1,7 @@
+/build/
+/.vscode/
+*.user
+*.log
+connections.json
+password_vault.dat
+master_password.hash

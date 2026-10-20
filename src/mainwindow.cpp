@@ -1,26 +1,79 @@
 #include "mainwindow.h"
 #include "logger.h"
+#include "legacyssh.h"
+#include <QApplication>
 #include <QVBoxLayout>
+#include <QHBoxLayout>
 #include <QHeaderView>
 #include <QMessageBox>
+#include <QClipboard>
 #include <QMenu>
 #include <QFont>
+#include <QFontDatabase>
 #include <QInputDialog>
 #include <QFile>
+#include <QFileInfo>
 #include <QTimer>
 #include <QFileDialog>
 #include <QTreeWidgetItem>
 #include <QStandardPaths>
 #include <QDir>
+#include <QLocale>
+#include <QMetaObject>
 #include <QStyle>
+#include <QMimeData>
+#include <QProcessEnvironment>
+#include <QDragEnterEvent>
+#include <QDropEvent>
+#include <QProgressBar>
+#include <QTabBar>
+
+namespace {
+QString formatBytes(qint64 bytes)
+{
+    static const char *units[] = {"Б", "КБ", "МБ", "ГБ", "ТБ"};
+    double amount = qMax<qint64>(bytes, 0);
+    int unit = 0;
+    while (amount >= 1024.0 && unit < 4) {
+        amount /= 1024.0;
+        ++unit;
+    }
+    return QString("%1 %2").arg(QLocale().toString(amount, 'f', unit == 0 ? 0 : 1), units[unit]);
+}
+
+const QString remoteMetricsCommand =
+    "awk '/^MemTotal:/{t=$2} /^MemAvailable:/{a=$2} "
+    "END{printf \"MEM %.0f %.0f\\n\",t*1024,(t-a)*1024}' /proc/meminfo; "
+    "awk '/^cpu /{idle=$5+$6; total=0; for(i=2;i<=NF;i++) total+=$i; "
+    "printf \"CPU %.0f %.0f\\n\",total,idle}' /proc/stat; "
+    "df -P -B1 -x tmpfs -x devtmpfs -x overlay -x squashfs | "
+    "awk 'NR>1 && $1 ~ /^\\/dev\\// && $1 !~ /^\\/dev\\/loop/ && "
+    "($6 == \"/\" || $6 == \"/home\" || $1 ~ /^\\/dev\\/mapper\\// || $1 ~ /^\\/dev\\/dm-/) "
+    "{printf \"DISK %s %s %s %s %s\\n\",$1,$2,$3,$4,$6}'";
+
+void showCopyableError(QWidget *parent, const QString &title, const QString &message)
+{
+    QMessageBox box(QMessageBox::Critical, title, message, QMessageBox::Ok, parent);
+    QPushButton *copyButton = box.addButton("Копировать текст ошибки", QMessageBox::ActionRole);
+    box.setTextInteractionFlags(Qt::TextSelectableByMouse | Qt::TextSelectableByKeyboard);
+    box.exec();
+    if (box.clickedButton() == copyButton) {
+        QApplication::clipboard()->setText(message);
+    }
+}
+}
 
 MainWindow::MainWindow(QWidget *parent)
     : QMainWindow(parent)
     , m_connectionManager(new ConnectionManager(this))
     , m_sshSession(new SshSession(this))
     , m_passwordManager(new PasswordManager(this))
-    , m_sftpManager(new SftpManager(this))
+    , m_sftpManager(nullptr)
     , m_currentTabIndex(-1)
+    , m_metricsTimer(new QTimer(this))
+    , m_dragDownloadInProgress(false)
+    , m_metricsRequestInFlight(false)
+    , m_metricsGeneration(0)
 {
     LOG_INFO("Запуск приложения LinuxXterm");
     
@@ -29,9 +82,9 @@ MainWindow::MainWindow(QWidget *parent)
     setupToolBar();
     setupConnections();
     checkSshpassInstalled();
-    
-    connect(m_sftpManager, &SftpManager::errorOccurred, this, &MainWindow::onSftpError);
-    connect(m_sftpManager, &SftpManager::directoryListed, this, &MainWindow::onDirectoryListed);
+    m_metricsTimer->setInterval(5000);
+    connect(m_metricsTimer, &QTimer::timeout, this, &MainWindow::updateServerMetrics);
+    m_metricsTimer->start();
     
     if (m_passwordManager->hasMasterPassword()) {
         ensureVaultUnlocked();
@@ -43,8 +96,16 @@ MainWindow::MainWindow(QWidget *parent)
 MainWindow::~MainWindow()
 {
     LOG_INFO("Закрытие приложения");
-    if (m_sftpManager->isConnected()) {
-        m_sftpManager->disconnect();
+    m_metricsTimer->stop();
+    for (QThread *thread : m_workerThreads) {
+        if (thread && thread->isRunning()) {
+            thread->wait();
+        }
+    }
+    for (const TerminalInfo &info : m_terminalTabs) {
+        if (info.sftpManager) {
+            info.sftpManager->disconnect();
+        }
     }
 }
 
@@ -55,28 +116,70 @@ void MainWindow::setupUi()
 
     mainSplitter = new QSplitter(Qt::Horizontal, this);
 
-    // Левая панель с вкладками
     leftPanelTabs = new QTabWidget(this);
     leftPanelTabs->setMinimumWidth(250);
     leftPanelTabs->setMaximumWidth(400);
 
-    // Вкладка "Подключения"
+    // === Вкладка "Подключения" с поиском ===
+    connectionsPanelWidget = new QWidget(this);
+    QVBoxLayout *connLayout = new QVBoxLayout(connectionsPanelWidget);
+    connLayout->setContentsMargins(2, 2, 2, 2);
+    connLayout->setSpacing(2);
+    
+    // Поисковая строка
+    searchLineEdit = new QLineEdit(this);
+    searchLineEdit->setPlaceholderText("🔍 Поиск по имени или хосту...");
+    searchLineEdit->setClearButtonEnabled(true);
+    searchLineEdit->setToolTip("Введите текст для фильтрации списка подключений");
+    connLayout->addWidget(searchLineEdit);
+    
+    // Дерево подключений
     connectionsTree = new QTreeWidget(this);
     connectionsTree->setHeaderLabels({"Имя", "Хост"});
     connectionsTree->setContextMenuPolicy(Qt::CustomContextMenu);
-    leftPanelTabs->addTab(connectionsTree, "Подключения");
+    connLayout->addWidget(connectionsTree, 1);
+    
+    leftPanelTabs->addTab(connectionsPanelWidget, "Подключения");
 
-    // Вкладка "Файлы"
-    fileTreeWidget = new QTreeWidget(this);
+    // === Вкладка "Файлы" ===
+    filePanelWidget = new QWidget(this);
+    QVBoxLayout *filePanelLayout = new QVBoxLayout(filePanelWidget);
+    filePanelLayout->setContentsMargins(2, 2, 2, 2);
+    filePanelLayout->setSpacing(2);
+    
+    QHBoxLayout *pathLayout = new QHBoxLayout();
+    pathLayout->setSpacing(2);
+    
+    pathLineEdit = new QLineEdit(this);
+    pathLineEdit->setPlaceholderText("/путь/к/директории");
+    pathLineEdit->setToolTip("Введите путь и нажмите Enter или кнопку");
+    pathLayout->addWidget(pathLineEdit, 1);
+    
+    navigateButton = new QPushButton("→", this);
+    navigateButton->setToolTip("Перейти к пути");
+    navigateButton->setMaximumWidth(30);
+    pathLayout->addWidget(navigateButton);
+    
+    syncButton = new QPushButton("⟳", this);
+    syncButton->setToolTip("Синхронизировать с терминалом (выполнить pwd)");
+    syncButton->setMaximumWidth(30);
+    pathLayout->addWidget(syncButton);
+    
+    filePanelLayout->addLayout(pathLayout);
+    
+    fileTreeWidget = new DropTreeWidget(this);
     fileTreeWidget->setHeaderLabels({"Имя", "Размер", "Дата"});
     fileTreeWidget->setContextMenuPolicy(Qt::CustomContextMenu);
     fileTreeWidget->setRootIsDecorated(false);
     fileTreeWidget->setAlternatingRowColors(true);
+    fileTreeWidget->setSelectionMode(QAbstractItemView::ExtendedSelection);
     
     QTreeWidgetItem *placeholder = new QTreeWidgetItem();
     placeholder->setText(0, "Подключитесь к серверу");
     fileTreeWidget->addTopLevelItem(placeholder);
-    leftPanelTabs->addTab(fileTreeWidget, "Файлы");
+    filePanelLayout->addWidget(fileTreeWidget, 1);
+    
+    leftPanelTabs->addTab(filePanelWidget, "Файлы");
 
     // Вкладки терминалов
     terminalTabs = new QTabWidget(this);
@@ -93,6 +196,19 @@ void MainWindow::setupUi()
     setCentralWidget(mainSplitter);
 
     statusBarWidget = statusBar();
+    transferProgressBar = new QProgressBar(statusBarWidget);
+    transferProgressBar->setRange(0, 100);
+    transferProgressBar->setTextVisible(true);
+    transferProgressBar->setMinimumWidth(360);
+    transferProgressBar->hide();
+    statusBarWidget->addPermanentWidget(transferProgressBar);
+
+    serverInfoLabel = new QLabel("Сервер: не подключен", statusBarWidget);
+    serverInfoLabel->setMinimumWidth(0);
+    serverInfoLabel->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
+    serverInfoLabel->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+    serverInfoLabel->setTextFormat(Qt::RichText);
+    statusBarWidget->addPermanentWidget(serverInfoLabel, 1);
     statusBarWidget->showMessage("Готов к работе");
 }
 
@@ -108,7 +224,8 @@ void MainWindow::setupTerminalWidget(CustomTermWidget *terminal)
 {
     if (!terminal) return;
     
-    QFont terminalFont("Monospace", 11);
+    QFont terminalFont = QFontDatabase::systemFont(QFontDatabase::FixedFont);
+    terminalFont.setPointSize(11);
     terminalFont.setStyleHint(QFont::Monospace);
     terminal->setTerminalFont(terminalFont);
     terminal->setColorScheme("Linux");
@@ -125,13 +242,21 @@ void MainWindow::replaceTerminalInTab(int index, CustomTermWidget *newTerminal,
     }
 
     TerminalInfo &oldInfo = m_terminalTabs[index];
+    terminalTabs->blockSignals(true);
     
     if (oldInfo.statusTimer) {
         oldInfo.statusTimer->stop();
         oldInfo.statusTimer->deleteLater();
     }
     
+    if (oldInfo.cwdMonitorTimer) {
+        oldInfo.cwdMonitorTimer->stop();
+        oldInfo.cwdMonitorTimer->deleteLater();
+    }
+    
+    terminalTabs->removeTab(index);
     if (oldInfo.terminal) {
+        QObject::disconnect(oldInfo.terminal, nullptr, this, nullptr);
         delete oldInfo.terminal;
     }
     
@@ -143,10 +268,15 @@ void MainWindow::replaceTerminalInTab(int index, CustomTermWidget *newTerminal,
     oldInfo.isConnected = isConnected;
     oldInfo.connectionId = connectionId;
     oldInfo.statusTimer = newTimer;
+    oldInfo.cwdMonitorTimer = nullptr;
+    oldInfo.sftpManager = nullptr;
+    oldInfo.sftpPath.clear();
     
-    terminalTabs->removeTab(index);
     terminalTabs->insertTab(index, newTerminal, shortenName(tabName));
     terminalTabs->setCurrentIndex(index);
+    terminalTabs->blockSignals(false);
+    connect(newTerminal, &QTermWidget::finished, this, &MainWindow::onTerminalProcessFinished);
+    onTabCurrentChanged(index);
     
     QTimer::singleShot(50, newTerminal, [newTerminal]() {
         newTerminal->setFocus(Qt::OtherFocusReason);
@@ -155,21 +285,61 @@ void MainWindow::replaceTerminalInTab(int index, CustomTermWidget *newTerminal,
     LOG_INFO(QString("Вкладка %1 заменена: %2").arg(index).arg(tabName));
 }
 
-void MainWindow::createTerminal(const QString &program, const QStringList &args, const QString &tabName)
+void MainWindow::createTerminal(const QString &program, const QStringList &args, const QString &tabName,
+                                bool allowLegacyHostKeys, const QString &sshpassPassword)
 {
-    QString logArgs = args.join(" ");
-    if (program == "/usr/bin/sshpass" && args.size() >= 2 && args[0] == "-p") {
-        logArgs = "-p *** " + args.mid(2).join(" ");
-    }
-    
+    const QString logArgs = args.join(" ");
     LOG_INFO(QString("Создание терминала: %1 %2 (вкладка: %3)").arg(program, logArgs, tabName));
 
     CustomTermWidget *terminal = new CustomTermWidget(0, this);
     setupTerminalWidget(terminal);
 
+    QProcessEnvironment environment = QProcessEnvironment::systemEnvironment();
+    if (program == "/usr/bin/sshpass" && !sshpassPassword.isEmpty()) {
+        environment.insert("SSHPASS", sshpassPassword);
+    }
+    if (allowLegacyHostKeys) {
+        QString configError;
+        const QString opensslConfig = legacySshOpenSslConfigPath(&configError);
+        if (opensslConfig.isEmpty() && !configError.isEmpty()) {
+            showCopyableError(this, "Ошибка настройки совместимости SSH", configError);
+            delete terminal;
+            return;
+        }
+        if (!opensslConfig.isEmpty()) {
+            environment.insert("OPENSSL_CONF", opensslConfig);
+        }
+    }
+    if (program == "/usr/bin/sshpass" || allowLegacyHostKeys) {
+        terminal->setEnvironment(environment.toStringList());
+    }
+
     terminal->setShellProgram(program);
     terminal->setArgs(args);
+    connect(terminal, &QTermWidget::receivedData, this, [this, terminal](const QString &text) {
+        for (auto it = m_terminalTabs.begin(); it != m_terminalTabs.end(); ++it) {
+            if (it.value().terminal == terminal) {
+                it.value().terminalOutput += text;
+                constexpr int maxDiagnosticLength = 16000;
+                if (it.value().terminalOutput.size() > maxDiagnosticLength) {
+                    it.value().terminalOutput.remove(0, it.value().terminalOutput.size() - maxDiagnosticLength);
+                }
+                const QString lowered = text.toLower();
+                if (lowered.contains("permission denied") ||
+                    lowered.contains("unable to negotiate") ||
+                    lowered.contains("no matching") ||
+                    lowered.contains("could not resolve hostname") ||
+                    lowered.contains("connection refused") ||
+                    lowered.contains("connection timed out") ||
+                    lowered.contains("host key verification failed")) {
+                    statusBarWidget->showMessage(text.trimmed().right(500), 15000);
+                }
+                break;
+            }
+        }
+    });
     terminal->startShellProgram();
+    connect(terminal, &QTermWidget::finished, this, &MainWindow::onTerminalProcessFinished);
 
     int index = terminalTabs->addTab(terminal, shortenName(tabName));
     terminalTabs->setCurrentIndex(index);
@@ -179,12 +349,23 @@ void MainWindow::createTerminal(const QString &program, const QStringList &args,
     info.connectionId = "";
     info.connectionName = tabName;
     info.isConnected = (program != "/bin/bash");
+    info.sftpManager = nullptr;
+    info.sftpPath.clear();
     
     info.statusTimer = new QTimer(this);
     info.statusTimer->start(2000);
     
-    connect(info.statusTimer, &QTimer::timeout, this, [this, index]() {
-        if (!m_terminalTabs.contains(index)) {
+    info.cwdMonitorTimer = nullptr;
+    
+    connect(info.statusTimer, &QTimer::timeout, this, [this, terminal]() {
+        bool terminalIsOpen = false;
+        for (const TerminalInfo &tabInfo : m_terminalTabs) {
+            if (tabInfo.terminal == terminal) {
+                terminalIsOpen = true;
+                break;
+            }
+        }
+        if (!terminalIsOpen) {
             QTimer *timer = qobject_cast<QTimer*>(sender());
             if (timer) {
                 timer->stop();
@@ -196,6 +377,7 @@ void MainWindow::createTerminal(const QString &program, const QStringList &args,
     
     m_terminalTabs[index] = info;
     m_currentTabIndex = index;
+    onTabCurrentChanged(index);
 
     QTimer::singleShot(50, terminal, [terminal]() {
         terminal->setFocus(Qt::OtherFocusReason);
@@ -216,9 +398,30 @@ void MainWindow::openConnectionInNewTab(const QString &connectionId)
     statusBarWidget->showMessage("Подключение к " + conn.getHost() + "...");
 
     QString password = m_passwordManager->getPassword(conn.getId());
+    if (password.isEmpty()) {
+        password = conn.getPassword();
+    }
+    if (password.isEmpty() && !conn.getUseKey()) {
+        bool passwordAccepted = false;
+        password = QInputDialog::getText(
+            this,
+            "Пароль подключения",
+            QString("Введите пароль для %1@%2 (он будет использован для SSH и SFTP):")
+                .arg(conn.getLogin(), conn.getHost()),
+            QLineEdit::Password,
+            QString(),
+            &passwordAccepted);
+        if (!passwordAccepted || password.isEmpty()) {
+            statusBarWidget->showMessage("Подключение отменено: пароль не введён", 5000);
+            return;
+        }
+    }
 
     QStringList sshArgs;
     sshArgs << "-o" << "StrictHostKeyChecking=accept-new";
+    if (conn.getAllowLegacyHostKeys()) {
+        sshArgs << legacySshOptions();
+    }
 
     if (conn.getPort() != 22) {
         sshArgs << "-p" << QString::number(conn.getPort());
@@ -239,54 +442,289 @@ void MainWindow::openConnectionInNewTab(const QString &connectionId)
     if (!password.isEmpty()) {
         program = "/usr/bin/sshpass";
         QStringList finalArgs;
-        finalArgs << "-p" << password << "/usr/bin/ssh" << sshArgs;
+        finalArgs << "-e" << "/usr/bin/ssh" << sshArgs;
         sshArgs = finalArgs;
-        LOG_INFO("Используется sshpass с паролем из хранилища");
+        LOG_INFO("Используется sshpass с паролем из профиля/хранилища");
     } else {
         LOG_INFO("Пароль не найден в хранилище, будет запрошен вручную в терминале");
     }
 
-    createTerminal(program, sshArgs, conn.getName());
+    createTerminal(program, sshArgs, conn.getName(), conn.getAllowLegacyHostKeys(), password);
 
     int currentIndex = terminalTabs->currentIndex();
     if (m_terminalTabs.contains(currentIndex)) {
-        m_terminalTabs[currentIndex].connectionId = conn.getId();
-        m_terminalTabs[currentIndex].connectionName = conn.getName();
-        m_terminalTabs[currentIndex].isConnected = true;
+        TerminalInfo &info = m_terminalTabs[currentIndex];
+        info.connectionId = conn.getId();
+        info.connectionName = conn.getName();
+        info.isConnected = true;
+        info.connection = conn;
+        info.password = password;
     }
 
     statusBarWidget->showMessage("Подключено к " + conn.getName());
     
-    // Инициализируем SFTP
     LOG_INFO("Инициализация SFTP подключения...");
     
-    if (m_sftpManager->isConnected()) {
-        m_sftpManager->disconnect();
+    SftpManager *sessionSftpManager = new SftpManager(this);
+    wireSftpManager(sessionSftpManager);
+    if (m_terminalTabs.contains(currentIndex)) {
+        m_terminalTabs[currentIndex].sftpManager = sessionSftpManager;
     }
-    
-    bool sftpConnected = m_sftpManager->connectToHost(
+    m_sftpManager = sessionSftpManager;
+
+    bool sftpConnected = sessionSftpManager->connectToHost(
         conn.getHost(),
         conn.getPort(),
         conn.getLogin(),
         password,
-        conn.getUseKey() ? conn.getPrivateKeyPath() : QString()
+        conn.getUseKey() ? conn.getPrivateKeyPath() : QString(),
+        conn.getAllowLegacyHostKeys()
     );
     
     if (sftpConnected) {
         statusBarWidget->showMessage("SFTP подключено, получение домашней директории...");
-        // Переключаемся на вкладку "Файлы"
-        leftPanelTabs->setCurrentWidget(fileTreeWidget);
+        leftPanelTabs->setCurrentWidget(filePanelWidget);
         
-        // Получаем реальную домашнюю директорию через SSH
-        QString homeDir = m_sftpManager->getHomeDirectory();
+        QString homeDir = sessionSftpManager->getHomeDirectory();
         if (!homeDir.isEmpty()) {
+            m_lastKnownCwd = homeDir;
+            if (m_terminalTabs.contains(currentIndex)) {
+                m_terminalTabs[currentIndex].sftpPath = homeDir;
+            }
             refreshSftpDirectory(homeDir);
+            // startCwdMonitoring(currentIndex);  //
         } else {
             refreshSftpDirectory("/");
         }
     } else {
-        statusBarWidget->showMessage("SFTP недоступно: " + m_sftpManager->lastError(), 5000);
+        const QString error = QString("Не удалось подключить файловую SFTP-сессию к %1:%2.\n\nПричина: %3")
+                                  .arg(conn.getHost())
+                                  .arg(conn.getPort())
+                                  .arg(sessionSftpManager->lastError());
+        statusBarWidget->showMessage("Ошибка SFTP: " + sessionSftpManager->lastError(), 10000);
+        setSftpPlaceholder("SFTP недоступно");
+        showCopyableError(this, "Ошибка подключения SFTP", error);
     }
+}
+
+void MainWindow::startCwdMonitoring(int tabIndex)
+{
+    if (!m_terminalTabs.contains(tabIndex)) return;
+    
+    TerminalInfo &info = m_terminalTabs[tabIndex];
+    
+    if (info.cwdMonitorTimer) {
+        info.cwdMonitorTimer->stop();
+        delete info.cwdMonitorTimer;
+    }
+    
+    info.cwdMonitorTimer = new QTimer(this);
+    info.cwdMonitorTimer->setInterval(2000);
+    
+    connect(info.cwdMonitorTimer, &QTimer::timeout, this, &MainWindow::onCwdMonitorTimeout);
+    info.cwdMonitorTimer->start();
+    
+    qDebug() << "MainWindow: запущен мониторинг директории для вкладки" << tabIndex;
+}
+
+void MainWindow::stopCwdMonitoring(int tabIndex)
+{
+    if (!m_terminalTabs.contains(tabIndex)) return;
+    
+    TerminalInfo &info = m_terminalTabs[tabIndex];
+    
+    if (info.cwdMonitorTimer) {
+        info.cwdMonitorTimer->stop();
+        delete info.cwdMonitorTimer;
+        info.cwdMonitorTimer = nullptr;
+    }
+    
+    qDebug() << "MainWindow: остановлен мониторинг директории для вкладки" << tabIndex;
+}
+
+QString MainWindow::readCwdFromFile()
+{
+    if (!m_sftpManager || !m_sftpManager->isConnected()) return QString();
+    
+    int currentIndex = terminalTabs->currentIndex();
+    if (!m_terminalTabs.contains(currentIndex)) return QString();
+    
+    CustomTermWidget *terminal = m_terminalTabs[currentIndex].terminal;
+    if (!terminal) return QString();
+    SftpManager *sftpManager = m_sftpManager;
+    
+    terminal->sendText("pwd > /tmp/.linuxxterm_cwd\n");
+    
+    QTimer::singleShot(200, this, [this, sftpManager]() {
+        if (m_sftpManager != sftpManager || !sftpManager->isConnected()) {
+            return;
+        }
+        QString tempLocalFile = QStandardPaths::writableLocation(QStandardPaths::TempLocation) + "/.linuxxterm_cwd_local";
+        
+        if (sftpManager->downloadFile("/tmp/.linuxxterm_cwd", tempLocalFile)) {
+            QFile file(tempLocalFile);
+            if (file.open(QIODevice::ReadOnly)) {
+                QString cwd = QString::fromUtf8(file.readAll()).trimmed();
+                file.close();
+                QFile::remove(tempLocalFile);
+                
+                qDebug() << "MainWindow::readCwdFromFile: текущая директория =" << cwd;
+                
+                if (!cwd.isEmpty() && cwd != m_lastKnownCwd) {
+                    qDebug() << "MainWindow: директория изменилась:" << m_lastKnownCwd << "->" << cwd;
+                    m_lastKnownCwd = cwd;
+                    refreshSftpDirectory(cwd);
+                }
+            }
+        }
+    });
+    
+    return QString();
+}
+
+void MainWindow::onCwdMonitorTimeout()
+{
+    int currentIndex = terminalTabs->currentIndex();
+    if (!m_terminalTabs.contains(currentIndex)) return;
+    
+    TerminalInfo &info = m_terminalTabs[currentIndex];
+    if (!info.isConnected) return;
+    
+    if (!m_sftpManager || !m_sftpManager->isConnected()) return;
+    
+    readCwdFromFile();
+}
+
+void MainWindow::updateServerMetrics()
+{
+    if (m_metricsRequestInFlight) {
+        return;
+    }
+
+    const int index = terminalTabs->currentIndex();
+    if (!m_terminalTabs.contains(index)) {
+        return;
+    }
+    const TerminalInfo info = m_terminalTabs[index];
+    if (!info.isConnected || !info.sftpManager || !info.sftpManager->isConnected()) {
+        return;
+    }
+
+    m_metricsRequestInFlight = true;
+    const quint64 generation = m_metricsGeneration;
+    CustomTermWidget *terminal = info.terminal;
+    const Connection connection = info.connection;
+    const QString password = info.password;
+    const bool allowLegacyHostKeys = connection.getAllowLegacyHostKeys();
+    serverInfoLabel->setToolTip("Обновление показателей сервера...");
+
+    QThread *thread = QThread::create(
+        [this, terminal, connection, password, generation, allowLegacyHostKeys]() {
+            SftpManager metricsManager;
+            QString output;
+            if (metricsManager.connectToHost(connection.getHost(), connection.getPort(),
+                                             connection.getLogin(), password,
+                                             connection.getUseKey() ? connection.getPrivateKeyPath()
+                                                                    : QString(),
+                                             allowLegacyHostKeys)) {
+                output = metricsManager.executeCommand(remoteMetricsCommand);
+                metricsManager.disconnect();
+            } else {
+                output = "ERROR " + metricsManager.lastError();
+            }
+
+            QMetaObject::invokeMethod(this, [this, terminal, output, generation]() {
+                if (generation != m_metricsGeneration) {
+                    return;
+                }
+                m_metricsRequestInFlight = false;
+                displayServerMetrics(terminal, output);
+            }, Qt::QueuedConnection);
+        });
+
+    m_workerThreads.append(thread);
+    connect(thread, &QThread::finished, this, [this, thread]() {
+        m_workerThreads.removeAll(thread);
+        thread->deleteLater();
+    });
+    thread->start();
+}
+
+void MainWindow::displayServerMetrics(CustomTermWidget *terminal, const QString &output)
+{
+    int index = -1;
+    for (auto it = m_terminalTabs.cbegin(); it != m_terminalTabs.cend(); ++it) {
+        if (it.value().terminal == terminal) {
+            index = it.key();
+            break;
+        }
+    }
+    if (index < 0 || index != terminalTabs->currentIndex()) {
+        return;
+    }
+    if (output.startsWith("ERROR ")) {
+        serverInfoLabel->setText(QString("Сервер: %1 | метрики недоступны").arg(m_terminalTabs[index].connectionName));
+        serverInfoLabel->setToolTip(output.mid(6));
+        return;
+    }
+
+    qint64 memoryTotal = 0;
+    qint64 memoryUsed = 0;
+    qint64 cpuTotal = 0;
+    qint64 cpuIdle = 0;
+    QStringList diskSummaries;
+    QStringList diskDetails;
+
+    const QStringList lines = output.split('\n', Qt::SkipEmptyParts);
+    for (const QString &line : lines) {
+        const QStringList fields = line.split(' ', Qt::SkipEmptyParts);
+        if (fields.size() >= 3 && fields[0] == "MEM") {
+            memoryTotal = fields[1].toLongLong();
+            memoryUsed = fields[2].toLongLong();
+        } else if (fields.size() >= 3 && fields[0] == "CPU") {
+            cpuTotal = fields[1].toLongLong();
+            cpuIdle = fields[2].toLongLong();
+        } else if (fields.size() >= 6 && fields[0] == "DISK") {
+            const qint64 total = fields[2].toLongLong();
+            const qint64 used = fields[3].toLongLong();
+            const qint64 available = fields[4].toLongLong();
+            const QString mount = fields[5];
+            const int usedPercent = total > 0
+                                        ? qBound(0, static_cast<int>(used * 100 / total), 100)
+                                        : 0;
+            const QString color = usedPercent > 95 ? "#ff4d4d"
+                                  : usedPercent > 80 ? "#ffad33"
+                                                     : "#3fcf70";
+            diskSummaries.append(QString("<span style=\"color:%1;font-weight:600\">%2 %3%</span>")
+                                     .arg(color, mount.toHtmlEscaped())
+                                     .arg(usedPercent));
+            diskDetails.append(QString("%1 (%2): занято %3 из %4, свободно %5")
+                                   .arg(fields[1], mount, formatBytes(used),
+                                        formatBytes(total), formatBytes(available)));
+        }
+    }
+
+    TerminalInfo &info = m_terminalTabs[index];
+    QString cpuText = "--";
+    const qint64 totalDelta = cpuTotal - info.previousCpuTotal;
+    const qint64 idleDelta = cpuIdle - info.previousCpuIdle;
+    if (info.previousCpuTotal > 0 && totalDelta > 0 && idleDelta >= 0) {
+        const int cpuPercent = qBound(0, static_cast<int>((totalDelta - idleDelta) * 100 / totalDelta), 100);
+        cpuText = QString("%1%").arg(cpuPercent);
+    }
+    info.previousCpuTotal = cpuTotal;
+    info.previousCpuIdle = cpuIdle;
+
+    const QString memoryText = memoryTotal > 0
+                                   ? QString("%1 / %2 (%3%)")
+                                         .arg(formatBytes(memoryUsed), formatBytes(memoryTotal))
+                                         .arg(memoryUsed * 100 / memoryTotal)
+                                   : "--";
+    const QString disksText = diskSummaries.isEmpty() ? "нет данных" : diskSummaries.join("  ");
+    serverInfoLabel->setText(QString("%1 | CPU %2 | RAM %3 | Диски %4")
+                                 .arg(info.connectionName.toHtmlEscaped(), cpuText, memoryText, disksText));
+    serverInfoLabel->setToolTip(diskDetails.isEmpty() ? "Данные о дисках не получены"
+                                                       : diskDetails.join('\n'));
 }
 
 void MainWindow::setupMenuBar()
@@ -351,6 +789,9 @@ void MainWindow::setupConnections()
 
     updateConnectionsList();
 
+    // === ПОИСК ПО ПОДКЛЮЧЕНИЯМ ===
+    connect(searchLineEdit, &QLineEdit::textChanged, this, &MainWindow::filterConnections);
+
     connect(connectionsTree, &QTreeWidget::itemDoubleClicked, this, [this](QTreeWidgetItem *item, int column) {
         Q_UNUSED(column);
         if (item) {
@@ -381,31 +822,41 @@ void MainWindow::setupConnections()
 
     connect(terminalTabs, &QTabWidget::tabCloseRequested, this, &MainWindow::onCloseTab);
     connect(terminalTabs, &QTabWidget::currentChanged, this, &MainWindow::onTabCurrentChanged);
+    connect(terminalTabs->tabBar(), &QTabBar::tabMoved, this, [this](int, int) {
+        reindexTerminalTabs();
+        onTabCurrentChanged(terminalTabs->currentIndex());
+    });
     
-    // Файловый менеджер - контекстное меню работает и на файлах, и на пустой области
     connect(fileTreeWidget, &QTreeWidget::itemDoubleClicked, this, &MainWindow::onFileDoubleClicked);
     connect(fileTreeWidget, &QTreeWidget::customContextMenuRequested, this, [this](const QPoint &pos) {
-        // Проверяем, есть ли элемент под курсором
         QTreeWidgetItem *item = fileTreeWidget->itemAt(pos);
         
-        // Создаём меню на стеке (безопасно, без вылетов)
         QMenu menu(this);
         
-        if (item) {
-            // Если кликнули на файл/папку - показываем полное меню
-            bool isDir = item->data(0, Qt::UserRole + 1).toBool();
-            QString path = item->data(0, Qt::UserRole).toString();
+        if (item && item->data(0, Qt::UserRole).toString() != "spacer") {
+            QList<QTreeWidgetItem*> selectedItems = fileTreeWidget->selectedItems();
             
-            // Пункт "Скачать" только для файлов
-            if (!isDir && path != "..") {
-                menu.addAction("Скачать", this, &MainWindow::onSftpDownload);
+            selectedItems.removeIf([](QTreeWidgetItem* item) {
+                return item->data(0, Qt::UserRole).toString() == "spacer" || 
+                       item->data(0, Qt::UserRole).toString() == "..";
+            });
+            
+            bool hasFiles = false;
+            for (QTreeWidgetItem* selItem : selectedItems) {
+                if (!selItem->data(0, Qt::UserRole + 1).toBool()) {
+                    hasFiles = true;
+                    break;
+                }
             }
             
-            menu.addAction("Загрузить файл в эту папку...", this, &MainWindow::onSftpUpload);
+            if (hasFiles) {
+                menu.addAction("Скачать выбранные файлы", this, &MainWindow::onSftpDownload);
+            }
             
-            // Пункт "Удалить" только для файлов/папок (не для "..")
-            if (path != "..") {
-                menu.addAction("Удалить", this, &MainWindow::onSftpDelete);
+            menu.addAction("Загрузить файлы сюда...", this, &MainWindow::onSftpUpload);
+            
+            if (selectedItems.size() > 0) {
+                menu.addAction("Удалить выбранные", this, &MainWindow::onSftpDelete);
             }
             
             menu.addSeparator();
@@ -415,8 +866,7 @@ void MainWindow::setupConnections()
                 refreshSftpDirectory(m_currentSftpPath);
             });
         } else {
-            // Если кликнули на пустую область - показываем только общие действия
-            menu.addAction("Загрузить файл в текущую папку...", this, &MainWindow::onSftpUpload);
+            menu.addAction("Загрузить файлы сюда...", this, &MainWindow::onSftpUpload);
             menu.addSeparator();
             menu.addAction("Создать папку здесь...", this, &MainWindow::onSftpCreateDirectory);
             menu.addSeparator();
@@ -427,6 +877,305 @@ void MainWindow::setupConnections()
         
         menu.exec(fileTreeWidget->viewport()->mapToGlobal(pos));
     });
+    
+    connect(fileTreeWidget, &DropTreeWidget::filesDropped, this, &MainWindow::onFilesDropped);
+    connect(fileTreeWidget, &DropTreeWidget::requestDragFromServer, this, &MainWindow::onRequestDragFromServer);
+    
+    connect(navigateButton, &QPushButton::clicked, this, &MainWindow::onNavigateToPath);
+    connect(pathLineEdit, &QLineEdit::returnPressed, this, &MainWindow::onNavigateToPath);
+    
+    connect(syncButton, &QPushButton::clicked, this, &MainWindow::onSyncWithTerminal);
+}
+
+void MainWindow::wireSftpManager(SftpManager *manager)
+{
+    connect(manager, &SftpManager::errorOccurred, this,
+            [this, manager](const QString &message) {
+        if (m_sftpManager == manager) {
+            onSftpError(message);
+        }
+    });
+    connect(manager, &SftpManager::directoryListed, this,
+            [this, manager](const QString &path, const QList<SftpFileInfo> &files) {
+        if (m_sftpManager == manager) {
+            onDirectoryListed(path, files);
+        }
+    });
+    connect(manager, &SftpManager::uploadProgress, this,
+            [this, manager](const QString &fileName, qint64 sent, qint64 total) {
+        if (m_sftpManager == manager) {
+            setTransferProgress(fileName, sent, total, true);
+        }
+    });
+    connect(manager, &SftpManager::downloadProgress, this,
+            [this, manager](const QString &fileName, qint64 received, qint64 total) {
+        if (m_sftpManager == manager) {
+            setTransferProgress(fileName, received, total);
+        }
+    });
+    connect(manager, &SftpManager::operationFinished, this,
+            [this, manager](const QString &, bool) {
+        if (m_sftpManager == manager && !m_dragDownloadInProgress) {
+            transferProgressBar->hide();
+        }
+    });
+}
+
+void MainWindow::setTransferProgress(const QString &fileName, qint64 bytesTransferred,
+                                     qint64 bytesTotal, bool upload)
+{
+    const int percent = bytesTotal > 0
+                            ? static_cast<int>(qMin<qint64>(100, bytesTransferred * 100 / bytesTotal))
+                            : 0;
+    const qint64 remaining = qMax<qint64>(0, bytesTotal - bytesTransferred);
+    transferProgressBar->setRange(0, 100);
+    transferProgressBar->setValue(percent);
+    transferProgressBar->setFormat(
+        QString("%1 %2% | скачано/передано: %3 | осталось: %4")
+            .arg(upload ? "На сервер" : "С сервера")
+            .arg(percent)
+            .arg(formatBytes(bytesTransferred))
+            .arg(bytesTotal > 0 ? formatBytes(remaining) : QString("?")));
+    transferProgressBar->setToolTip(fileName);
+    transferProgressBar->show();
+    transferProgressBar->repaint();
+}
+
+void MainWindow::setSftpPlaceholder(const QString &text)
+{
+    fileTreeWidget->clear();
+    QTreeWidgetItem *placeholder = new QTreeWidgetItem();
+    placeholder->setText(0, text);
+    fileTreeWidget->addTopLevelItem(placeholder);
+    pathLineEdit->clear();
+}
+
+void MainWindow::reindexTerminalTabs()
+{
+    QMap<int, TerminalInfo> reindexed;
+    for (int index = 0; index < terminalTabs->count(); ++index) {
+        auto *terminal = qobject_cast<CustomTermWidget *>(terminalTabs->widget(index));
+        if (!terminal) {
+            continue;
+        }
+        for (auto it = m_terminalTabs.cbegin(); it != m_terminalTabs.cend(); ++it) {
+            if (it.value().terminal == terminal) {
+                reindexed.insert(index, it.value());
+                break;
+            }
+        }
+    }
+    m_terminalTabs = reindexed;
+}
+
+// === МЕТОД ФИЛЬТРАЦИИ ПОДКЛЮЧЕНИЙ ===
+void MainWindow::filterConnections(const QString &searchText)
+{
+    QString search = searchText.trimmed().toLower();
+    
+    for (int i = 0; i < connectionsTree->topLevelItemCount(); ++i) {
+        QTreeWidgetItem *item = connectionsTree->topLevelItem(i);
+        if (!item) continue;
+        
+        QString name = item->text(0).toLower();
+        QString host = item->text(1).toLower();
+        
+        // Показываем элемент, если поиск пустой ИЛИ имя/хост содержат подстроку
+        bool matches = search.isEmpty() || name.contains(search) || host.contains(search);
+        item->setHidden(!matches);
+    }
+    
+    // Обновляем счётчик в статусной строке
+    int visibleCount = 0;
+    int totalCount = connectionsTree->topLevelItemCount();
+    for (int i = 0; i < totalCount; ++i) {
+        QTreeWidgetItem *item = connectionsTree->topLevelItem(i);
+        if (item && !item->isHidden()) {
+            visibleCount++;
+        }
+    }
+    
+    if (search.isEmpty()) {
+        statusBarWidget->showMessage(QString("Подключения: %1").arg(totalCount), 2000);
+    } else {
+        statusBarWidget->showMessage(QString("Найдено: %1 из %1 подключений").arg(visibleCount).arg(totalCount), 2000);
+    }
+}
+
+void MainWindow::onNavigateToPath()
+{
+    if (!m_sftpManager || !m_sftpManager->isConnected()) {
+        QMessageBox::warning(this, "Внимание", "SFTP не подключен");
+        return;
+    }
+    
+    QString path = pathLineEdit->text().trimmed();
+    if (path.isEmpty()) {
+        return;
+    }
+    
+    if (!path.startsWith("/")) {
+        if (m_currentSftpPath.endsWith("/")) {
+            path = m_currentSftpPath + path;
+        } else {
+            path = m_currentSftpPath + "/" + path;
+        }
+    }
+    
+    refreshSftpDirectory(path);
+}
+
+void MainWindow::onSyncWithTerminal()
+{
+    if (!m_sftpManager || !m_sftpManager->isConnected()) {
+        QMessageBox::warning(this, "Внимание", "SFTP не подключен");
+        return;
+    }
+    
+    statusBarWidget->showMessage("Синхронизация с терминалом...");
+    
+    readCwdFromFile();
+}
+
+void MainWindow::onFilesDropped(const QStringList &filePaths)
+{
+    if (!m_sftpManager || !m_sftpManager->isConnected()) {
+        QMessageBox::warning(this, "Внимание", "SFTP не подключен");
+        return;
+    }
+    
+    if (filePaths.isEmpty()) return;
+    
+    statusBarWidget->showMessage(QString("Загрузка %1 файл(ов)...").arg(filePaths.size()));
+    
+    int successCount = 0;
+    int failCount = 0;
+    
+    for (const QString &localPath : filePaths) {
+        QFileInfo fileInfo(localPath);
+        
+        QString remotePath = m_currentSftpPath.endsWith("/") ? 
+            m_currentSftpPath + fileInfo.fileName() : 
+            m_currentSftpPath + "/" + fileInfo.fileName();
+        
+        if (m_sftpManager->uploadFile(localPath, remotePath)) {
+            successCount++;
+        } else {
+            failCount++;
+        }
+    }
+    
+    if (successCount > 0) {
+        statusBarWidget->showMessage(QString("Загружено: %1 файл(ов)").arg(successCount), 3000);
+        refreshSftpDirectory(m_currentSftpPath);
+    }
+    
+    if (failCount > 0) {
+        QMessageBox::warning(this, "Ошибка", QString("Не удалось загрузить %1 файл(ов)").arg(failCount));
+    }
+}
+
+void MainWindow::onRequestDragFromServer(const QStringList &remotePaths)
+{
+    if (!m_sftpManager || !m_sftpManager->isConnected()) {
+        QMessageBox::warning(this, "Внимание", "SFTP не подключен");
+        return;
+    }
+    if (m_dragDownloadInProgress) {
+        statusBarWidget->showMessage("Скачивание для перетаскивания уже выполняется");
+        return;
+    }
+    const int tabIndex = terminalTabs->currentIndex();
+    if (!m_terminalTabs.contains(tabIndex)) {
+        return;
+    }
+
+    const TerminalInfo info = m_terminalTabs[tabIndex];
+    QString tempDir = QStandardPaths::writableLocation(QStandardPaths::TempLocation);
+    if (tempDir.isEmpty()) {
+        tempDir = QDir::tempPath();
+    }
+    const QString targetDirectory = tempDir + "/linuxxterm_dragdrop";
+    if (!QDir().mkpath(targetDirectory)) {
+        QMessageBox::warning(this, "Ошибка", "Не удалось создать временную папку для скачивания");
+        return;
+    }
+
+    const QStringList paths = remotePaths;
+    const Connection connection = info.connection;
+    const QString password = info.password;
+    const bool allowLegacyHostKeys = connection.getAllowLegacyHostKeys();
+    CustomTermWidget *originTerminal = info.terminal;
+    m_dragDownloadInProgress = true;
+    transferProgressBar->setRange(0, 0);
+    transferProgressBar->setFormat("Подключение для скачивания...");
+    transferProgressBar->show();
+    statusBarWidget->showMessage("Подготовка файлов для перетаскивания — удерживайте левую кнопку мыши");
+
+    QThread *thread = QThread::create(
+        [this, paths, targetDirectory, connection, password, allowLegacyHostKeys, originTerminal]() {
+            SftpManager transferManager;
+            QStringList localPaths;
+            QStringList failedPaths;
+            QString failureReason;
+
+            QObject::connect(&transferManager, &SftpManager::downloadProgress, this,
+                             [this](const QString &fileName, qint64 received, qint64 total) {
+                setTransferProgress(fileName, received, total);
+            }, Qt::QueuedConnection);
+
+            if (!transferManager.connectToHost(connection.getHost(), connection.getPort(),
+                                               connection.getLogin(), password,
+                                               connection.getUseKey() ? connection.getPrivateKeyPath()
+                                                                      : QString(),
+                                               allowLegacyHostKeys)) {
+                failureReason = transferManager.lastError();
+            } else {
+                for (const QString &remotePath : paths) {
+                    const QString localPath = targetDirectory + "/" + QFileInfo(remotePath).fileName();
+                    if (transferManager.downloadFile(remotePath, localPath)) {
+                        localPaths.append(localPath);
+                    } else {
+                        failedPaths.append(remotePath);
+                    }
+                }
+            }
+
+            transferManager.disconnect();
+            QMetaObject::invokeMethod(this,
+                                      [this, localPaths, failedPaths, failureReason, originTerminal]() {
+                m_dragDownloadInProgress = false;
+                transferProgressBar->hide();
+
+                bool originStillOpen = false;
+                for (const TerminalInfo &tabInfo : m_terminalTabs) {
+                    if (tabInfo.terminal == originTerminal) {
+                        originStillOpen = true;
+                        break;
+                    }
+                }
+                if (!originStillOpen) {
+                    return;
+                }
+                if (!localPaths.isEmpty()) {
+                    fileTreeWidget->startDragWithLocalFiles(localPaths);
+                }
+                if (!failureReason.isEmpty()) {
+                    QMessageBox::warning(this, "Ошибка", "Не удалось подключиться для скачивания:\n" + failureReason);
+                } else if (!failedPaths.isEmpty()) {
+                    QMessageBox::warning(this, "Ошибка",
+                                         QString("Не удалось скачать %1 из %2 файла(ов)")
+                                             .arg(failedPaths.size()).arg(failedPaths.size() + localPaths.size()));
+                }
+            }, Qt::QueuedConnection);
+        });
+
+    m_workerThreads.append(thread);
+    connect(thread, &QThread::finished, this, [this, thread]() {
+        m_workerThreads.removeAll(thread);
+        thread->deleteLater();
+    });
+    thread->start();
 }
 
 void MainWindow::onTabCurrentChanged(int index)
@@ -434,15 +1183,45 @@ void MainWindow::onTabCurrentChanged(int index)
     m_currentTabIndex = index;
     if (m_terminalTabs.contains(index)) {
         const TerminalInfo &info = m_terminalTabs[index];
+        m_sftpManager = info.sftpManager;
+        ++m_metricsGeneration;
+        m_metricsRequestInFlight = false;
         if (info.isConnected) {
             statusBarWidget->showMessage("Подключено к " + info.connectionName);
+            if (info.sftpManager && info.sftpManager->isConnected()) {
+                if (info.sftpPath.isEmpty()) {
+                    m_currentSftpPath = info.sftpManager->getHomeDirectory();
+                } else {
+                    m_currentSftpPath = info.sftpPath;
+                }
+                leftPanelTabs->setCurrentWidget(filePanelWidget);
+                if (!m_currentSftpPath.isEmpty()) {
+                    refreshSftpDirectory(m_currentSftpPath);
+                }
+            } else {
+                setSftpPlaceholder("SFTP недоступно");
+            }
         } else {
             statusBarWidget->showMessage("Локальный терминал");
+            setSftpPlaceholder("Подключитесь к серверу");
         }
         
         if (info.terminal) {
             info.terminal->setFocus(Qt::OtherFocusReason);
         }
+        serverInfoLabel->setText(info.isConnected
+                                     ? QString("Сервер: %1 | CPU -- | RAM -- | Диски --")
+                                           .arg(info.connectionName.toHtmlEscaped())
+                                     : "Сервер: не подключен");
+        if (info.isConnected) {
+            updateServerMetrics();
+        }
+    } else {
+        m_sftpManager = nullptr;
+        ++m_metricsGeneration;
+        m_metricsRequestInFlight = false;
+        serverInfoLabel->setText("Сервер: не подключен");
+        setSftpPlaceholder("Подключитесь к серверу");
     }
 }
 
@@ -463,28 +1242,52 @@ void MainWindow::onCloseTab(int index)
         if (reply != QMessageBox::Yes) return;
     }
 
+    removeTerminalTab(index, true);
+}
+
+void MainWindow::removeTerminalTab(int index, bool createLocalTab)
+{
+    if (!m_terminalTabs.contains(index)) {
+        return;
+    }
+    const TerminalInfo info = m_terminalTabs[index];
+
     if (info.statusTimer) {
         info.statusTimer->stop();
         info.statusTimer->deleteLater();
     }
-
-    terminalTabs->removeTab(index);
     
+    if (info.cwdMonitorTimer) {
+        info.cwdMonitorTimer->stop();
+        info.cwdMonitorTimer->deleteLater();
+    }
+
+    terminalTabs->blockSignals(true);
+    terminalTabs->removeTab(index);
+    m_terminalTabs.remove(index);
+    reindexTerminalTabs();
+    terminalTabs->blockSignals(false);
+
     if (info.terminal) {
+        QObject::disconnect(info.terminal, nullptr, this, nullptr);
         delete info.terminal;
     }
-    
-    m_terminalTabs.remove(index);
 
-    if (info.isConnected && m_sftpManager->isConnected()) {
-        m_sftpManager->disconnect();
-        fileTreeWidget->clear();
-        QTreeWidgetItem *placeholder = new QTreeWidgetItem();
-        placeholder->setText(0, "SFTP отключено");
-        fileTreeWidget->addTopLevelItem(placeholder);
+    if (info.sftpManager) {
+        if (m_sftpManager == info.sftpManager) {
+            m_sftpManager = nullptr;
+        }
+        info.sftpManager->disconnect();
+        info.sftpManager->deleteLater();
     }
 
-    if (terminalTabs->count() == 0) {
+    if (terminalTabs->count() > 0) {
+        onTabCurrentChanged(terminalTabs->currentIndex());
+    } else {
+        onTabCurrentChanged(-1);
+    }
+
+    if (createLocalTab && terminalTabs->count() == 0) {
         createTerminal("/bin/bash", QStringList(), "Локальный терминал");
     }
 }
@@ -500,6 +1303,9 @@ void MainWindow::updateConnectionsList()
         item->setData(0, Qt::UserRole, conn.getId());
         connectionsTree->addTopLevelItem(item);
     }
+    
+    // Применяем текущий фильтр, если он есть
+    filterConnections(searchLineEdit->text());
 }
 
 void MainWindow::onNewConnection()
@@ -633,29 +1439,8 @@ void MainWindow::onDisconnect()
 
     LOG_INFO(QString("Отключение от сервера: %1").arg(info.connectionName));
 
-    if (info.statusTimer) {
-        info.statusTimer->stop();
-        info.statusTimer->deleteLater();
-    }
-
-    terminalTabs->removeTab(currentIndex);
-    
-    if (info.terminal) {
-        delete info.terminal;
-    }
-    
-    m_terminalTabs.remove(currentIndex);
-
-    if (m_sftpManager->isConnected()) {
-        m_sftpManager->disconnect();
-        fileTreeWidget->clear();
-        QTreeWidgetItem *placeholder = new QTreeWidgetItem();
-        placeholder->setText(0, "SFTP отключено");
-        fileTreeWidget->addTopLevelItem(placeholder);
-    }
-
+    removeTerminalTab(currentIndex, false);
     createTerminal("/bin/bash", QStringList(), "Локальный терминал");
-    
     statusBarWidget->showMessage("Отключено");
 }
 
@@ -685,34 +1470,65 @@ void MainWindow::onTerminalProcessFinished()
         info.statusTimer->stop();
         info.statusTimer->deleteLater();
     }
-
-    if (m_sftpManager->isConnected()) {
-        m_sftpManager->disconnect();
-        fileTreeWidget->clear();
-        QTreeWidgetItem *placeholder = new QTreeWidgetItem();
-        placeholder->setText(0, "SFTP отключено (разрыв соединения)");
-        fileTreeWidget->addTopLevelItem(placeholder);
+    
+    if (info.cwdMonitorTimer) {
+        info.cwdMonitorTimer->stop();
+        info.cwdMonitorTimer->deleteLater();
     }
 
-    statusBarWidget->showMessage("Соединение разорвано: " + info.connectionName, 5000);
+    if (info.sftpManager) {
+        info.sftpManager->disconnect();
+        info.sftpManager->deleteLater();
+        if (m_sftpManager == info.sftpManager) {
+            m_sftpManager = nullptr;
+            ++m_metricsGeneration;
+            m_metricsRequestInFlight = false;
+            setSftpPlaceholder("SFTP отключено (разрыв соединения)");
+            serverInfoLabel->setText("Сервер: " + info.connectionName + " | отключен");
+        }
+        info.sftpManager = nullptr;
+    }
 
-    QMessageBox msgBox(this);
-    msgBox.setWindowTitle("Соединение разорвано");
-    msgBox.setText("SSH-сессия завершена: " + info.connectionName);
-    msgBox.setInformativeText("Соединение с сервером было разорвано. Хотите переподключиться?");
-    msgBox.setStandardButtons(QMessageBox::Yes | QMessageBox::No);
+    const QString connectionName = info.connectionName;
+    const QString connectionId = info.connectionId;
+    statusBarWidget->showMessage("Соединение разорвано: " + connectionName, 5000);
+
+    const QString diagnostic = m_terminalTabs[finishedIndex].terminalOutput.trimmed();
+    const QString details = diagnostic.isEmpty()
+                                ? QString("SSH-клиент завершился без диагностического текста.\n"
+                                          "Проверьте адрес, порт, доступность сервера и параметры SSH.")
+                                : diagnostic;
+    QMessageBox msgBox(QMessageBox::Warning, "Ошибка SSH-подключения",
+                       "SSH-сессия с сервером \"" + connectionName + "\" завершилась.\n"
+                       "Подробности доступны ниже. Хотите переподключиться?",
+                       QMessageBox::Yes | QMessageBox::No, this);
+    msgBox.setDetailedText(details);
+    msgBox.setTextInteractionFlags(Qt::TextSelectableByMouse | Qt::TextSelectableByKeyboard);
     msgBox.setDefaultButton(QMessageBox::No);
-    msgBox.setIcon(QMessageBox::Warning);
+    QPushButton *copyButton = msgBox.addButton("Копировать текст ошибки", QMessageBox::ActionRole);
 
-    int ret = msgBox.exec();
+    int ret;
+    do {
+        ret = msgBox.exec();
+        if (msgBox.clickedButton() == copyButton) {
+            QApplication::clipboard()->setText(details);
+            statusBarWidget->showMessage("Текст ошибки скопирован в буфер обмена", 5000);
+        }
+    } while (msgBox.clickedButton() == copyButton);
     if (ret == QMessageBox::Yes) {
         LOG_INFO("Пользователь выбрал переподключение");
-        if (!info.connectionId.isEmpty()) {
-            openConnectionInNewTab(info.connectionId);
+        if (!connectionId.isEmpty()) {
+            openConnectionInNewTab(connectionId);
         }
-        if (m_terminalTabs.contains(finishedIndex)) {
-            if (info.terminal) delete info.terminal;
-            m_terminalTabs.remove(finishedIndex);
+        int oldIndex = -1;
+        for (auto it = m_terminalTabs.cbegin(); it != m_terminalTabs.cend(); ++it) {
+            if (it.value().terminal == finishedTerminal) {
+                oldIndex = it.key();
+                break;
+            }
+        }
+        if (oldIndex >= 0) {
+            removeTerminalTab(oldIndex, false);
         }
     } else {
         LOG_INFO("Замена на локальный терминал");
@@ -722,6 +1538,7 @@ void MainWindow::onTerminalProcessFinished()
         localTerminal->setShellProgram("/bin/bash");
         localTerminal->setArgs(QStringList());
         localTerminal->startShellProgram();
+        connect(localTerminal, &QTermWidget::finished, this, &MainWindow::onTerminalProcessFinished);
 
         replaceTerminalInTab(finishedIndex, localTerminal, "Локальный терминал", false, "");
     }
@@ -731,9 +1548,11 @@ void MainWindow::onAbout()
 {
     QMessageBox::about(this, "О программе", 
         "<h2>LinuxXterm</h2>"
-        "<p>Версия 1.0.0</p>"
-        "<p>Удобный SSH-клиент для Linux</p>"
-        "<p>© 2026</p>"
+        "<p>Версия 1.0.2</p>"
+        "<p>SSH-терминал и файловый менеджер SFTP для Linux</p>"
+        "<p>Автор и издатель: Hellhost</p>"
+        "<p>Помощь с разработкой: AI assistant using Copilot SDK in VS Code</p>"
+        "<p>© 2026 Hellhost</p>"
     );
 }
 
@@ -748,21 +1567,25 @@ void MainWindow::onSftpError(const QString &message)
 void MainWindow::onDirectoryListed(const QString &path, const QList<SftpFileInfo> &files)
 {
     m_currentSftpPath = path;
+    pathLineEdit->setText(path);
+    const int currentIndex = terminalTabs->currentIndex();
+    if (m_terminalTabs.contains(currentIndex)) {
+        m_terminalTabs[currentIndex].sftpPath = path;
+    }
+    
     fileTreeWidget->clear();
     
-    // Добавляем пустой элемент для удобного клика правой кнопкой мыши
     QTreeWidgetItem *spacerItem = new QTreeWidgetItem();
     spacerItem->setText(0, " ");
     spacerItem->setData(0, Qt::UserRole, "spacer");
     spacerItem->setData(0, Qt::UserRole + 1, false);
     fileTreeWidget->addTopLevelItem(spacerItem);
     
-    // Добавляем ".." для перехода в родительскую директорию (если не в корне)
     if (path != "/" && path != "~") {
         QTreeWidgetItem *parentItem = new QTreeWidgetItem();
         parentItem->setText(0, "..");
         parentItem->setData(0, Qt::UserRole, "..");
-        parentItem->setData(0, Qt::UserRole + 1, true); // isDir
+        parentItem->setData(0, Qt::UserRole + 1, true);
         parentItem->setIcon(0, style()->standardIcon(QStyle::SP_ArrowUp));
         fileTreeWidget->addTopLevelItem(parentItem);
     }
@@ -807,12 +1630,11 @@ void MainWindow::onDirectoryListed(const QString &path, const QList<SftpFileInfo
 void MainWindow::onFileDoubleClicked(QTreeWidgetItem *item, int column)
 {
     Q_UNUSED(column);
-    if (!item) return;
+    if (!item || !m_sftpManager || !m_sftpManager->isConnected()) return;
     
     QString path = item->data(0, Qt::UserRole).toString();
     bool isDir = item->data(0, Qt::UserRole + 1).toBool();
     
-    // Обработка ".." - переход в родительскую директорию
     if (path == "..") {
         QString parentPath = m_currentSftpPath;
         if (parentPath.endsWith("/")) {
@@ -853,81 +1675,169 @@ void MainWindow::onFileDoubleClicked(QTreeWidgetItem *item, int column)
 
 void MainWindow::onSftpDownload()
 {
-    QTreeWidgetItem *item = fileTreeWidget->currentItem();
-    if (!item) return;
+    if (!m_sftpManager || !m_sftpManager->isConnected()) {
+        QMessageBox::warning(this, "Внимание", "SFTP не подключен");
+        return;
+    }
+    QList<QTreeWidgetItem*> selectedItems = fileTreeWidget->selectedItems();
     
-    bool isDir = item->data(0, Qt::UserRole + 1).toBool();
-    if (isDir) {
-        QMessageBox::information(this, "Внимание", "Нельзя скачать папку (только файлы)");
+    selectedItems.removeIf([](QTreeWidgetItem* item) {
+        return item->data(0, Qt::UserRole).toString() == "spacer" || 
+               item->data(0, Qt::UserRole).toString() == "..";
+    });
+    
+    if (selectedItems.isEmpty()) {
+        QMessageBox::information(this, "Внимание", "Выберите файлы для скачивания");
         return;
     }
     
-    onFileDoubleClicked(item, 0);
+    bool hasFiles = false;
+    for (QTreeWidgetItem* item : selectedItems) {
+        if (!item->data(0, Qt::UserRole + 1).toBool()) {
+            hasFiles = true;
+            break;
+        }
+    }
+    
+    if (!hasFiles) {
+        QMessageBox::information(this, "Внимание", "Нельзя скачать папки (только файлы)");
+        return;
+    }
+    
+    QString saveDir = QFileDialog::getExistingDirectory(
+        this,
+        "Выберите папку для сохранения",
+        QStandardPaths::writableLocation(QStandardPaths::DownloadLocation)
+    );
+    
+    if (saveDir.isEmpty()) return;
+    
+    statusBarWidget->showMessage(QString("Скачивание %1 файл(ов)...").arg(selectedItems.size()));
+    
+    int successCount = 0;
+    int failCount = 0;
+    
+    for (QTreeWidgetItem* item : selectedItems) {
+        bool isDir = item->data(0, Qt::UserRole + 1).toBool();
+        if (isDir) continue;
+        
+        QString path = item->data(0, Qt::UserRole).toString();
+        QString fileName = item->text(0);
+        QString localPath = saveDir + "/" + fileName;
+        
+        if (m_sftpManager->downloadFile(path, localPath)) {
+            successCount++;
+        } else {
+            failCount++;
+        }
+    }
+    
+    if (successCount > 0) {
+        statusBarWidget->showMessage(QString("Скачано: %1 файл(ов)").arg(successCount), 3000);
+    }
+    
+    if (failCount > 0) {
+        QMessageBox::warning(this, "Ошибка", QString("Не удалось скачать %1 файл(ов)").arg(failCount));
+    }
 }
 
 void MainWindow::onSftpUpload()
 {
-    if (!m_sftpManager->isConnected()) {
+    if (!m_sftpManager || !m_sftpManager->isConnected()) {
         QMessageBox::warning(this, "Внимание", "SFTP не подключен");
         return;
     }
     
-    QString localPath = QFileDialog::getOpenFileName(
+    QStringList localPaths = QFileDialog::getOpenFileNames(
         this,
-        "Выберите файл для загрузки",
+        "Выберите файлы для загрузки",
         QDir::homePath(),
         "Все файлы (*)"
     );
     
-    if (localPath.isEmpty()) return;
+    if (localPaths.isEmpty()) return;
     
-    QFileInfo fileInfo(localPath);
-    QString remotePath = m_currentSftpPath.endsWith("/") ? 
-        m_currentSftpPath + fileInfo.fileName() : 
-        m_currentSftpPath + "/" + fileInfo.fileName();
+    statusBarWidget->showMessage(QString("Загрузка %1 файл(ов)...").arg(localPaths.size()));
     
-    statusBarWidget->showMessage("Загрузка: " + fileInfo.fileName());
-    bool success = m_sftpManager->uploadFile(localPath, remotePath);
+    int successCount = 0;
+    int failCount = 0;
     
-    if (success) {
-        statusBarWidget->showMessage("Файл загружен: " + remotePath, 3000);
+    for (const QString &localPath : localPaths) {
+        QFileInfo fileInfo(localPath);
+        QString remotePath = m_currentSftpPath.endsWith("/") ? 
+            m_currentSftpPath + fileInfo.fileName() : 
+            m_currentSftpPath + "/" + fileInfo.fileName();
+        
+        if (m_sftpManager->uploadFile(localPath, remotePath)) {
+            successCount++;
+        } else {
+            failCount++;
+        }
+    }
+    
+    if (successCount > 0) {
+        statusBarWidget->showMessage(QString("Загружено: %1 файл(ов)").arg(successCount), 3000);
         refreshSftpDirectory(m_currentSftpPath);
-    } else {
-        QMessageBox::warning(this, "Ошибка", "Не удалось загрузить файл:\n" + m_sftpManager->lastError());
+    }
+    
+    if (failCount > 0) {
+        QMessageBox::warning(this, "Ошибка", QString("Не удалось загрузить %1 файл(ов)").arg(failCount));
     }
 }
 
 void MainWindow::onSftpDelete()
 {
-    QTreeWidgetItem *item = fileTreeWidget->currentItem();
-    if (!item) return;
+    if (!m_sftpManager || !m_sftpManager->isConnected()) {
+        QMessageBox::warning(this, "Внимание", "SFTP не подключен");
+        return;
+    }
+    QList<QTreeWidgetItem*> selectedItems = fileTreeWidget->selectedItems();
     
-    QString path = item->data(0, Qt::UserRole).toString();
-    if (path == "..") return; // Нельзя удалить ".."
+    selectedItems.removeIf([](QTreeWidgetItem* item) {
+        return item->data(0, Qt::UserRole).toString() == "spacer" || 
+               item->data(0, Qt::UserRole).toString() == "..";
+    });
     
-    bool isDir = item->data(0, Qt::UserRole + 1).toBool();
+    if (selectedItems.isEmpty()) {
+        QMessageBox::information(this, "Внимание", "Выберите файлы для удаления");
+        return;
+    }
     
     QMessageBox::StandardButton reply = QMessageBox::question(
         this,
         "Подтверждение",
-        QString("Удалить %1 \"%2\"?").arg(isDir ? "папку" : "файл").arg(item->text(0)),
+        QString("Удалить выбранные элементы (%1)?").arg(selectedItems.size()),
         QMessageBox::Yes | QMessageBox::No
     );
     
-    if (reply == QMessageBox::Yes) {
-        bool success = m_sftpManager->deleteFile(path);
-        if (success) {
-            statusBarWidget->showMessage("Удалено: " + path, 3000);
-            refreshSftpDirectory(m_currentSftpPath);
+    if (reply != QMessageBox::Yes) return;
+    
+    int successCount = 0;
+    int failCount = 0;
+    
+    for (QTreeWidgetItem* item : selectedItems) {
+        QString path = item->data(0, Qt::UserRole).toString();
+        
+        if (m_sftpManager->deleteFile(path)) {
+            successCount++;
         } else {
-            QMessageBox::warning(this, "Ошибка", "Не удалось удалить:\n" + m_sftpManager->lastError());
+            failCount++;
         }
+    }
+    
+    if (successCount > 0) {
+        statusBarWidget->showMessage(QString("Удалено: %1 элемент(ов)").arg(successCount), 3000);
+        refreshSftpDirectory(m_currentSftpPath);
+    }
+    
+    if (failCount > 0) {
+        QMessageBox::warning(this, "Ошибка", QString("Не удалось удалить %1 элемент(ов)").arg(failCount));
     }
 }
 
 void MainWindow::onSftpCreateDirectory()
 {
-    if (!m_sftpManager->isConnected()) {
+    if (!m_sftpManager || !m_sftpManager->isConnected()) {
         QMessageBox::warning(this, "Внимание", "SFTP не подключен");
         return;
     }
@@ -952,7 +1862,7 @@ void MainWindow::onSftpCreateDirectory()
 
 void MainWindow::refreshSftpDirectory(const QString &path)
 {
-    if (!m_sftpManager->isConnected()) {
+    if (!m_sftpManager || !m_sftpManager->isConnected()) {
         statusBarWidget->showMessage("SFTP не подключен");
         return;
     }

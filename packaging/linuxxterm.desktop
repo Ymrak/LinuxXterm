@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=LinuxXterm
+Comment=SSH клиент с файловым менеджером
+Exec=/usr/local/bin/linuxxterm
+Icon=linuxxterm
+Terminal=false
+Type=Application
+Categories=Network;RemoteAccess;System;
+Keywords=ssh;sftp;terminal;remote;
+StartupNotify=true

@@ -4,6 +4,7 @@
 Connection::Connection()
     : m_port(22)
     , m_useKey(false)
+    , m_allowLegacyHostKeys(false)
 {
     m_id = generateId();
 }
@@ -18,6 +19,7 @@ Connection::Connection(const QString &name, const QString &host, int port,
     , m_password(password)
     , m_privateKeyPath(privateKeyPath)
     , m_useKey(useKey)
+    , m_allowLegacyHostKeys(false)
 {
     m_id = generateId();
 }
@@ -31,6 +33,7 @@ QString Connection::getLogin() const { return m_login; }
 QString Connection::getPassword() const { return m_password; }
 QString Connection::getPrivateKeyPath() const { return m_privateKeyPath; }
 bool Connection::getUseKey() const { return m_useKey; }
+bool Connection::getAllowLegacyHostKeys() const { return m_allowLegacyHostKeys; }
 
 // Сеттеры
 void Connection::setId(const QString &id) { m_id = id; }
@@ -41,6 +44,7 @@ void Connection::setLogin(const QString &login) { m_login = login; }
 void Connection::setPassword(const QString &password) { m_password = password; }
 void Connection::setPrivateKeyPath(const QString &path) { m_privateKeyPath = path; }
 void Connection::setUseKey(bool useKey) { m_useKey = useKey; }
+void Connection::setAllowLegacyHostKeys(bool allow) { m_allowLegacyHostKeys = allow; }
 
 // Сериализация в JSON (пароль хранится в открытом виде, т.к. основная защита — PasswordManager)
 QJsonObject Connection::toJson() const
@@ -54,6 +58,7 @@ QJsonObject Connection::toJson() const
     json["password"] = m_password;  // Теперь без шифрования
     json["privateKeyPath"] = m_privateKeyPath;
     json["useKey"] = m_useKey;
+    json["allowLegacyHostKeys"] = m_allowLegacyHostKeys;
     return json;
 }
 
@@ -68,6 +73,7 @@ Connection Connection::fromJson(const QJsonObject &json)
     conn.setPassword(json["password"].toString());  // Без расшифровки
     conn.setPrivateKeyPath(json["privateKeyPath"].toString());
     conn.setUseKey(json["useKey"].toBool(false));
+    conn.setAllowLegacyHostKeys(json["allowLegacyHostKeys"].toBool(false));
     return conn;
 }
 

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(LinuxXterm VERSION 1.0.0 LANGUAGES CXX)
+project(LinuxXterm VERSION 1.0.2 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -41,6 +41,8 @@ set(SOURCES
     src/masterpassworddialog.cpp
     src/customtermwidget.cpp
     src/sftpmanager.cpp
+    src/droptreewidget.cpp
+    src/legacyssh.cpp
 )
 
 # Заголовочные файлы
@@ -56,6 +58,8 @@ set(HEADERS
     include/masterpassworddialog.h
     include/customtermwidget.h
     include/sftpmanager.h
+    include/droptreewidget.h
+    include/legacyssh.h
 )
 
 add_executable(linuxxterm ${SOURCES} ${HEADERS})

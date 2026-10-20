@@ -1,8 +1,16 @@
 #include "sftpmanager.h"
+#include "legacyssh.h"
 #include <QDebug>
 #include <QFile>
 #include <QFileInfo>
 #include <QDir>
+#include <QDate>
+#include <QElapsedTimer>
+#include <QLocale>
+#include <QProcess>
+#include <QProcessEnvironment>
+#include <QRegularExpression>
+#include <QStandardPaths>
 
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -10,6 +18,46 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <netdb.h>
+#include <sys/time.h>
+#include <poll.h>
+#include <cerrno>
+#include <cstring>
+
+namespace {
+bool connectWithTimeout(int socketFd, const sockaddr *address, socklen_t addressLength)
+{
+    const int originalFlags = fcntl(socketFd, F_GETFL, 0);
+    if (originalFlags < 0 || fcntl(socketFd, F_SETFL, originalFlags | O_NONBLOCK) < 0) {
+        return false;
+    }
+
+    int connectResult = ::connect(socketFd, address, addressLength);
+    if (connectResult < 0 && errno == EINPROGRESS) {
+        pollfd descriptor{};
+        descriptor.fd = socketFd;
+        descriptor.events = POLLOUT;
+        connectResult = poll(&descriptor, 1, 10000);
+        if (connectResult > 0) {
+            int socketError = 0;
+            socklen_t errorLength = sizeof(socketError);
+            if (getsockopt(socketFd, SOL_SOCKET, SO_ERROR, &socketError, &errorLength) < 0 ||
+                socketError != 0) {
+                connectResult = -1;
+            } else {
+                connectResult = 0;
+            }
+        } else {
+            connectResult = -1;
+            errno = ETIMEDOUT;
+        }
+    }
+
+    const int savedError = errno;
+    const int restoreResult = fcntl(socketFd, F_SETFL, originalFlags);
+    errno = savedError;
+    return connectResult == 0 && restoreResult == 0;
+}
+}
 
 SftpManager::SftpManager(QObject *parent)
     : QObject(parent)
@@ -18,7 +66,6 @@ SftpManager::SftpManager(QObject *parent)
     , m_socket(-1)
     , m_isConnected(false)
 {
-    // Инициализация libssh2 при первом использовании (потокобезопасная)
     static bool libssh2Initialized = false;
     if (!libssh2Initialized) {
         libssh2_init(0);
@@ -33,7 +80,8 @@ SftpManager::~SftpManager()
 }
 
 bool SftpManager::connectToHost(const QString &host, int port, const QString &user, 
-                                const QString &password, const QString &privateKeyPath)
+                                const QString &password, const QString &privateKeyPath,
+                                bool allowLegacyHostKeys)
 {
     if (m_isConnected) {
         disconnect();
@@ -41,48 +89,98 @@ bool SftpManager::connectToHost(const QString &host, int port, const QString &us
 
     m_lastError.clear();
 
-    // 1. Резолвинг адреса через getaddrinfo (поддержка доменов и IPv4/IPv6)
+    if (allowLegacyHostKeys) {
+        m_legacyMode = true;
+        m_host = host;
+        m_port = port;
+        m_user = user;
+        m_password = password;
+        m_privateKeyPath = privateKeyPath;
+        m_allowLegacyHostKeys = true;
+
+        QByteArray output;
+        if (!runLegacySftpBatch({"pwd"}, &output)) {
+            m_legacyMode = false;
+            m_password.clear();
+            m_privateKeyPath.clear();
+            return false;
+        }
+
+        const QRegularExpression homePattern(
+            "Remote working directory:\\s*(.+)",
+            QRegularExpression::CaseInsensitiveOption);
+        const QRegularExpressionMatch match = homePattern.match(QString::fromUtf8(output));
+        if (match.hasMatch()) {
+            m_homeDirectory = match.captured(1).trimmed();
+        }
+        if (m_homeDirectory.isEmpty()) {
+            setError("SSH подключился, но SFTP-сервер не сообщил домашний каталог");
+            m_legacyMode = false;
+            m_password.clear();
+            m_privateKeyPath.clear();
+            return false;
+        }
+
+        m_isConnected = true;
+        emit connected();
+        return true;
+    }
+
+    m_legacyMode = false;
+    m_password.clear();
+    m_privateKeyPath.clear();
     struct addrinfo hints;
     struct addrinfo *result = nullptr;
     
     memset(&hints, 0, sizeof(struct addrinfo));
-    hints.ai_family = AF_UNSPEC;     // IPv4 или IPv6
-    hints.ai_socktype = SOCK_STREAM; // TCP
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
     
     std::string hostUtf8 = host.toStdString();
     std::string portStr = std::to_string(port);
     
     int res = getaddrinfo(hostUtf8.c_str(), portStr.c_str(), &hints, &result);
     if (res != 0) {
-        setError(QString("Не удалось резолвить адрес %1: %2").arg(host).arg(gai_strerror(res)));
+        setError(QString("Не удалось найти сервер «%1»: %2")
+                     .arg(host, QString::fromLocal8Bit(gai_strerror(res))));
         return false;
     }
 
-    // 2. Создание сокета и подключение (пытаемся по всем полученным адресам)
     m_socket = -1;
+    int lastConnectError = 0;
     struct addrinfo *rp;
     for (rp = result; rp != nullptr; rp = rp->ai_next) {
         m_socket = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
         if (m_socket == -1) {
-            continue; // Пробуем следующий адрес
+            continue;
         }
 
-        if (::connect(m_socket, rp->ai_addr, rp->ai_addrlen) == 0) {
-            break; // Успешно подключились
+        if (connectWithTimeout(m_socket, rp->ai_addr, rp->ai_addrlen)) {
+            break;
         }
 
+        lastConnectError = errno;
         close(m_socket);
         m_socket = -1;
     }
 
-    freeaddrinfo(result); // Освобождаем ресурсы getaddrinfo
+    freeaddrinfo(result);
 
     if (m_socket == -1) {
-        setError(QString("Не удалось подключиться к %1:%2").arg(host).arg(port));
+        setError(QString("Не удалось подключиться к серверу %1:%2: %3")
+                     .arg(host)
+                     .arg(port)
+                     .arg(lastConnectError == 0
+                              ? QString("превышено время ожидания")
+                              : QString::fromLocal8Bit(std::strerror(lastConnectError))));
         return false;
     }
 
-    // 3. Инициализация сессии libssh2
+    timeval socketTimeout{};
+    socketTimeout.tv_sec = 30;
+    setsockopt(m_socket, SOL_SOCKET, SO_RCVTIMEO, &socketTimeout, sizeof(socketTimeout));
+    setsockopt(m_socket, SOL_SOCKET, SO_SNDTIMEO, &socketTimeout, sizeof(socketTimeout));
+
     m_session = libssh2_session_init_ex(nullptr, nullptr, nullptr, this);
     if (!m_session) {
         setError("Не удалось инициализировать сессию libssh2");
@@ -93,9 +191,20 @@ bool SftpManager::connectToHost(const QString &host, int port, const QString &us
 
     libssh2_session_set_blocking(m_session, 1);
 
-    // 4. Рукопожатие (handshake)
-    if (libssh2_session_handshake(m_session, m_socket)) {
-        setError("Ошибка рукопожатия SSH");
+    if (allowLegacyHostKeys &&
+        (libssh2_session_method_pref(m_session, LIBSSH2_METHOD_HOSTKEY, "ssh-rsa") != 0 ||
+         libssh2_session_method_pref(m_session, LIBSSH2_METHOD_KEX,
+                                    "diffie-hellman-group14-sha1,diffie-hellman-group1-sha1,"
+                                    "diffie-hellman-group-exchange-sha1") != 0 ||
+         libssh2_session_method_pref(m_session, LIBSSH2_METHOD_CRYPT_CS,
+                                    "aes128-cbc,aes256-cbc,3des-cbc,aes128-ctr,aes256-ctr") != 0 ||
+         libssh2_session_method_pref(m_session, LIBSSH2_METHOD_CRYPT_SC,
+                                    "aes128-cbc,aes256-cbc,3des-cbc,aes128-ctr,aes256-ctr") != 0 ||
+         libssh2_session_method_pref(m_session, LIBSSH2_METHOD_MAC_CS,
+                                    "hmac-sha1,hmac-sha2-256") != 0 ||
+         libssh2_session_method_pref(m_session, LIBSSH2_METHOD_MAC_SC,
+                                    "hmac-sha1,hmac-sha2-256") != 0)) {
+        setError("Установленная libssh2 не поддерживает один из алгоритмов старого SSH-сервера");
         libssh2_session_free(m_session);
         m_session = nullptr;
         close(m_socket);
@@ -103,20 +212,40 @@ bool SftpManager::connectToHost(const QString &host, int port, const QString &us
         return false;
     }
 
-    // 5. Аутентификация
+    if (libssh2_session_handshake(m_session, m_socket)) {
+        char *errorMessage = nullptr;
+        int errorLength = 0;
+        const int errorCode = libssh2_session_last_error(m_session, &errorMessage, &errorLength, 0);
+        const QString details = errorMessage && errorLength > 0
+                                    ? QString::fromUtf8(errorMessage, errorLength).trimmed()
+                                    : QString("код libssh2 %1").arg(errorCode);
+        setError(QString("Ошибка согласования SSH-алгоритмов: %1").arg(details));
+        libssh2_session_free(m_session);
+        m_session = nullptr;
+        close(m_socket);
+        m_socket = -1;
+        return false;
+    }
+
     int authResult = -1;
-    if (!privateKeyPath.isEmpty() && QFile::exists(privateKeyPath)) {
-        // Аутентификация по ключу
+    if (!privateKeyPath.isEmpty() && !QFile::exists(privateKeyPath)) {
+        setError(QString("Файл приватного ключа не найден: %1").arg(privateKeyPath));
+        libssh2_session_free(m_session);
+        m_session = nullptr;
+        close(m_socket);
+        m_socket = -1;
+        return false;
+    }
+    if (!privateKeyPath.isEmpty()) {
         authResult = libssh2_userauth_publickey_fromfile_ex(
             m_session,
             user.toUtf8().constData(),
             user.toUtf8().length(),
-            nullptr, // публичный ключ (можно оставить nullptr, libssh2 найдёт его сам)
+            nullptr,
             privateKeyPath.toUtf8().constData(),
-            password.toUtf8().constData() // пароль для расшифровки приватного ключа, если есть
+            password.toUtf8().constData()
         );
     } else {
-        // Аутентификация по паролю
         authResult = libssh2_userauth_password_ex(
             m_session,
             user.toUtf8().constData(),
@@ -128,7 +257,9 @@ bool SftpManager::connectToHost(const QString &host, int port, const QString &us
     }
 
     if (authResult != 0) {
-        setError("Ошибка аутентификации. Проверьте логин, пароль или ключ.");
+        setError(QString("Сервер отклонил аутентификацию для пользователя «%1». "
+                         "Проверьте логин, пароль или приватный ключ.")
+                     .arg(user));
         libssh2_session_disconnect_ex(m_session, SSH_DISCONNECT_BY_APPLICATION, "Auth failed", "");
         libssh2_session_free(m_session);
         m_session = nullptr;
@@ -137,7 +268,6 @@ bool SftpManager::connectToHost(const QString &host, int port, const QString &us
         return false;
     }
 
-    // 6. Инициализация SFTP подсистемы
     m_sftp = libssh2_sftp_init(m_session);
     if (!m_sftp) {
         setError("Не удалось инициализировать SFTP подсистему");
@@ -158,6 +288,15 @@ bool SftpManager::connectToHost(const QString &host, int port, const QString &us
 void SftpManager::disconnect()
 {
     if (!m_isConnected) return;
+
+    if (m_legacyMode) {
+        m_isConnected = false;
+        m_legacyMode = false;
+        m_password.clear();
+        m_privateKeyPath.clear();
+        emit disconnected();
+        return;
+    }
 
     if (m_sftp) {
         libssh2_sftp_shutdown(m_sftp);
@@ -180,26 +319,26 @@ void SftpManager::disconnect()
 
 QString SftpManager::getHomeDirectory()
 {
+    if (m_legacyMode && m_isConnected) {
+        return m_homeDirectory;
+    }
     if (!m_isConnected || !m_session) {
         setError("SFTP не подключен");
         return QString();
     }
 
-    // Открываем SSH канал для выполнения команды
     LIBSSH2_CHANNEL *channel = libssh2_channel_open_session(m_session);
     if (!channel) {
         setError("Не удалось открыть SSH канал");
         return QString();
     }
 
-    // Выполняем команду echo $HOME
     if (libssh2_channel_exec(channel, "echo $HOME") != 0) {
         setError("Не удалось выполнить команду");
         libssh2_channel_free(channel);
         return QString();
     }
 
-    // Читаем результат
     char buffer[1024];
     QString homePath;
     int bytesRead;
@@ -212,16 +351,99 @@ QString SftpManager::getHomeDirectory()
     libssh2_channel_close(channel);
     libssh2_channel_free(channel);
 
-    // Убираем перенос строки в конце
     homePath = homePath.trimmed();
     
     qDebug() << "SftpManager: Home directory:" << homePath;
     return homePath;
 }
 
+QString SftpManager::executeCommand(const QString &command)
+{
+    if (m_legacyMode && m_isConnected) {
+        return runLegacySshCommand(command);
+    }
+    if (!m_isConnected || !m_session) {
+        setError("SFTP не подключен");
+        return QString();
+    }
+
+    LIBSSH2_CHANNEL *channel = libssh2_channel_open_session(m_session);
+    if (!channel) {
+        setError("Не удалось открыть SSH канал");
+        return QString();
+    }
+
+    if (libssh2_channel_exec(channel, command.toUtf8().constData()) != 0) {
+        setError(QString("Не удалось выполнить команду: %1").arg(command));
+        libssh2_channel_free(channel);
+        return QString();
+    }
+
+    char buffer[4096];
+    QString output;
+    int bytesRead;
+    
+    while ((bytesRead = libssh2_channel_read(channel, buffer, sizeof(buffer) - 1)) > 0) {
+        buffer[bytesRead] = '\0';
+        output += QString::fromUtf8(buffer);
+    }
+
+    libssh2_channel_close(channel);
+    libssh2_channel_free(channel);
+
+    // Убираем перенос строки в конце
+    output = output.trimmed();
+    
+    qDebug() << "SftpManager: executeCommand('" << command << "') ->" << output;
+    return output;
+}
+
 QList<SftpFileInfo> SftpManager::listDirectory(const QString &remotePath)
 {
     QList<SftpFileInfo> fileList;
+    if (m_legacyMode && m_isConnected) {
+        QByteArray output;
+        if (!runLegacySftpBatch({"ls -l " + quoteSftpArgument(remotePath)}, &output)) {
+            return fileList;
+        }
+
+        const QRegularExpression linePattern(
+            "^([bcdlps-][rwxStTs-]{9}\\+?)\\s+\\d+\\s+\\S+\\s+\\S+\\s+"
+            "(\\d+)\\s+([A-Za-z]{3})\\s+(\\d{1,2})\\s+(\\S+)\\s+(.+)$");
+        const QStringList lines = QString::fromUtf8(output).split('\n', Qt::SkipEmptyParts);
+        for (const QString &line : lines) {
+            const QRegularExpressionMatch match = linePattern.match(line.trimmed());
+            if (!match.hasMatch()) {
+                continue;
+            }
+            SftpFileInfo info;
+            info.name = match.captured(6);
+            info.path = remotePath.endsWith('/')
+                            ? remotePath + info.name
+                            : remotePath + "/" + info.name;
+            info.size = match.captured(2).toLongLong();
+            info.isDir = match.captured(1).startsWith('d');
+            const QString datePart = match.captured(3) + " " + match.captured(4) + " " + match.captured(5);
+            QDateTime modified = QLocale::c().toDateTime(datePart, "MMM d yyyy");
+            if (!modified.isValid()) {
+                modified = QLocale::c().toDateTime(
+                    datePart, "MMM d hh:mm");
+                if (modified.isValid()) {
+                    modified.setDate(QDate(QDate::currentDate().year(),
+                                           modified.date().month(),
+                                           modified.date().day()));
+                }
+            }
+            info.modifiedTime = modified;
+            fileList.append(info);
+        }
+        if (fileList.isEmpty() && !output.trimmed().isEmpty()) {
+            setError("Не удалось разобрать ответ SFTP при чтении каталога");
+            return {};
+        }
+        emit directoryListed(remotePath, fileList);
+        return fileList;
+    }
     if (!m_isConnected || !m_sftp) {
         setError("SFTP не подключен");
         return fileList;
@@ -240,7 +462,6 @@ QList<SftpFileInfo> SftpManager::listDirectory(const QString &remotePath)
     while (libssh2_sftp_readdir_ex(sftpHandle, mem, sizeof(mem), longentry, sizeof(longentry), &attrs) > 0) {
         QString fileName = QString::fromUtf8(mem);
         
-        // Пропускаем текущую и родительскую директории
         if (fileName == "." || fileName == "..") {
             continue;
         }
@@ -263,6 +484,35 @@ QList<SftpFileInfo> SftpManager::listDirectory(const QString &remotePath)
 
 bool SftpManager::downloadFile(const QString &remotePath, const QString &localPath)
 {
+    if (m_legacyMode && m_isConnected) {
+        const bool localFileExisted = QFileInfo::exists(localPath);
+        const QFileInfo remoteInfo(remotePath);
+        QString remoteDirectory = remoteInfo.path();
+        if (remoteDirectory.isEmpty()) {
+            remoteDirectory = ".";
+        }
+        qint64 remoteSize = -1;
+        const QList<SftpFileInfo> remoteFiles = listDirectory(remoteDirectory);
+        for (const SftpFileInfo &file : remoteFiles) {
+            if (file.name == remoteInfo.fileName()) {
+                remoteSize = file.size;
+                break;
+            }
+        }
+        if (!runLegacySftpBatch({"get " + quoteSftpArgument(remotePath) + " " +
+                                 quoteSftpArgument(localPath)},
+                                nullptr, remoteInfo.fileName(), localPath, remoteSize)) {
+            if (!localFileExisted) {
+                QFile::remove(localPath);
+            }
+            emit operationFinished(QFileInfo(remotePath).fileName(), false);
+            return false;
+        }
+        const qint64 bytes = QFileInfo(localPath).size();
+        emit downloadProgress(remoteInfo.fileName(), bytes, remoteSize >= 0 ? remoteSize : bytes);
+        emit operationFinished(QFileInfo(remotePath).fileName(), true);
+        return true;
+    }
     if (!m_isConnected || !m_sftp) {
         setError("SFTP не подключен");
         return false;
@@ -274,26 +524,56 @@ bool SftpManager::downloadFile(const QString &remotePath, const QString &localPa
     );
     if (!sftpHandle) {
         setError(QString("Не удалось открыть удаленный файл: %1").arg(remotePath));
+        emit operationFinished(remotePath, false);
         return false;
+    }
+
+    // Получаем размер файла для прогресса
+    LIBSSH2_SFTP_ATTRIBUTES attrs{};
+    qint64 fileSize = 0;
+    if (libssh2_sftp_fstat_ex(sftpHandle, &attrs, 0) == 0 &&
+        (attrs.flags & LIBSSH2_SFTP_ATTR_SIZE)) {
+        fileSize = static_cast<qint64>(attrs.filesize);
     }
 
     QFile localFile(localPath);
     if (!localFile.open(QIODevice::WriteOnly)) {
         setError(QString("Не удалось открыть локальный файл для записи: %1").arg(localPath));
         libssh2_sftp_close(sftpHandle);
+        emit operationFinished(remotePath, false);
         return false;
     }
 
     char buffer[32768];
     int bytesRead;
     bool success = true;
+    qint64 totalRead = 0;
 
+    QFileInfo fileInfo(remotePath);
+    QString fileName = fileInfo.fileName();
+
+    emit downloadProgress(fileName, 0, fileSize);
     while ((bytesRead = libssh2_sftp_read(sftpHandle, buffer, sizeof(buffer))) > 0) {
         if (localFile.write(buffer, bytesRead) != bytesRead) {
             setError("Ошибка записи в локальный файл");
             success = false;
             break;
         }
+        
+        totalRead += bytesRead;
+        emit downloadProgress(fileName, totalRead, fileSize);
+    }
+
+    if (bytesRead < 0 && success) {
+        setError(QString("Ошибка чтения удаленного файла %1 (код %2)")
+                     .arg(remotePath)
+                     .arg(libssh2_session_last_errno(m_session)));
+        success = false;
+    }
+    if (success && fileSize > 0 && totalRead != fileSize) {
+        setError(QString("Скачан неполный файл %1: %2 из %3 байт")
+                     .arg(remotePath).arg(totalRead).arg(fileSize));
+        success = false;
     }
 
     localFile.close();
@@ -301,12 +581,27 @@ bool SftpManager::downloadFile(const QString &remotePath, const QString &localPa
 
     if (success) {
         qDebug() << "SftpManager: Файл успешно скачан:" << remotePath;
+        emit operationFinished(fileName, true);
+    } else {
+        QFile::remove(localPath);
+        emit operationFinished(fileName, false);
     }
     return success;
 }
 
 bool SftpManager::uploadFile(const QString &localPath, const QString &remotePath)
 {
+    if (m_legacyMode && m_isConnected) {
+        if (!runLegacySftpBatch({"put " + quoteSftpArgument(localPath) + " " +
+                                 quoteSftpArgument(remotePath)})) {
+            emit operationFinished(QFileInfo(localPath).fileName(), false);
+            return false;
+        }
+        const qint64 bytes = QFileInfo(localPath).size();
+        emit uploadProgress(QFileInfo(localPath).fileName(), bytes, bytes);
+        emit operationFinished(QFileInfo(localPath).fileName(), true);
+        return true;
+    }
     if (!m_isConnected || !m_sftp) {
         setError("SFTP не подключен");
         return false;
@@ -315,8 +610,11 @@ bool SftpManager::uploadFile(const QString &localPath, const QString &remotePath
     QFile localFile(localPath);
     if (!localFile.open(QIODevice::ReadOnly)) {
         setError(QString("Не удалось открыть локальный файл для чтения: %1").arg(localPath));
+        emit operationFinished(localPath, false);
         return false;
     }
+
+    qint64 fileSize = localFile.size();
 
     LIBSSH2_SFTP_HANDLE *sftpHandle = libssh2_sftp_open(
         m_sftp, remotePath.toUtf8().constData(),
@@ -326,6 +624,7 @@ bool SftpManager::uploadFile(const QString &localPath, const QString &remotePath
     if (!sftpHandle) {
         setError(QString("Не удалось создать удаленный файл: %1").arg(remotePath));
         localFile.close();
+        emit operationFinished(localPath, false);
         return false;
     }
 
@@ -333,49 +632,48 @@ bool SftpManager::uploadFile(const QString &localPath, const QString &remotePath
     qint64 bytesRead;
     bool success = true;
     qint64 totalWritten = 0;
-    qint64 fileSize = localFile.size();
 
-    qDebug() << "SftpManager: Начинаем загрузку файла" << localPath << "->" << remotePath;
-    qDebug() << "SftpManager: Размер файла:" << fileSize << "байт";
+    QFileInfo fileInfo(localPath);
+    QString fileName = fileInfo.fileName();
 
     while ((bytesRead = localFile.read(buffer, sizeof(buffer))) > 0) {
-        qint64 bytesWritten = 0;
         qint64 remaining = bytesRead;
         char *writePtr = buffer;
 
-        // Обрабатываем частичную запись (libssh2_sftp_write может записать меньше байт)
         while (remaining > 0) {
             int rc = libssh2_sftp_write(sftpHandle, writePtr, remaining);
             if (rc < 0) {
-                // Реальная ошибка
                 setError(QString("Ошибка записи в удаленный файл (код %1)").arg(rc));
                 success = false;
                 break;
             }
-            bytesWritten += rc;
+            totalWritten += rc;
             remaining -= rc;
             writePtr += rc;
-            totalWritten += rc;
         }
 
         if (!success) break;
 
-        // Прогресс загрузки
-        int progress = (totalWritten * 100) / fileSize;
-        qDebug() << "SftpManager: Прогресс:" << progress << "% (" << totalWritten << "/" << fileSize << ")";
+        emit uploadProgress(fileName, totalWritten, fileSize);
     }
 
     localFile.close();
     libssh2_sftp_close(sftpHandle);
 
     if (success) {
-        qDebug() << "SftpManager: Файл успешно загружен:" << remotePath << "(" << totalWritten << "байт)";
+        qDebug() << "SftpManager: Файл успешно загружен:" << remotePath;
+        emit operationFinished(fileName, true);
+    } else {
+        emit operationFinished(fileName, false);
     }
     return success;
 }
 
 bool SftpManager::deleteFile(const QString &remotePath)
 {
+    if (m_legacyMode && m_isConnected) {
+        return runLegacySftpBatch({"rm " + quoteSftpArgument(remotePath)});
+    }
     if (!m_isConnected || !m_sftp) {
         setError("SFTP не подключен");
         return false;
@@ -394,6 +692,9 @@ bool SftpManager::deleteFile(const QString &remotePath)
 
 bool SftpManager::createDirectory(const QString &remotePath)
 {
+    if (m_legacyMode && m_isConnected) {
+        return runLegacySftpBatch({"mkdir " + quoteSftpArgument(remotePath)});
+    }
     if (!m_isConnected || !m_sftp) {
         setError("SFTP не подключен");
         return false;
@@ -420,4 +721,215 @@ void SftpManager::setError(const QString &error)
     m_lastError = error;
     qWarning() << "SftpManager Error:" << error;
     emit errorOccurred(error);
+}
+
+QString SftpManager::quoteSftpArgument(const QString &argument)
+{
+    QString escaped = argument;
+    escaped.replace('\\', "\\\\");
+    escaped.replace('"', "\\\"");
+    escaped.replace('\n', "\\n");
+    escaped.replace('\r', "\\r");
+    return "\"" + escaped + "\"";
+}
+
+bool SftpManager::runLegacySftpBatch(const QStringList &commands, QByteArray *standardOutput,
+                                     const QString &progressFile,
+                                     const QString &localProgressPath,
+                                     qint64 progressTotal)
+{
+    m_lastError.clear();
+    QString opensslError;
+    const QString opensslConfig = legacySshOpenSslConfigPath(&opensslError);
+    if (!opensslError.isEmpty()) {
+        setError(opensslError);
+        return false;
+    }
+
+    const QString sftpPath = QStandardPaths::findExecutable("sftp");
+    if (sftpPath.isEmpty()) {
+        setError("Не найден системный клиент OpenSSH sftp");
+        return false;
+    }
+
+    QStringList arguments;
+    arguments << "-P" << QString::number(m_port);
+    for (const QString &option : legacySshOptions()) {
+        arguments << option;
+    }
+    arguments << "-o" << "StrictHostKeyChecking=accept-new";
+    arguments << "-o" << "NumberOfPasswordPrompts=1";
+    arguments << "-o" << "BatchMode=no";
+    if (!m_privateKeyPath.isEmpty()) {
+        arguments << "-i" << m_privateKeyPath;
+    }
+    const bool usePasswordAuthentication = !m_password.isEmpty() && m_privateKeyPath.isEmpty();
+    if (usePasswordAuthentication) {
+        arguments << "-o" << "PreferredAuthentications=password,keyboard-interactive";
+        arguments << "-o" << "PubkeyAuthentication=no";
+    }
+    arguments << (m_user + "@" + m_host);
+
+    QProcess process;
+    QProcessEnvironment environment = QProcessEnvironment::systemEnvironment();
+    if (!opensslConfig.isEmpty()) {
+        environment.insert("OPENSSL_CONF", opensslConfig);
+    }
+    QString executable = sftpPath;
+    if (!m_password.isEmpty() && m_privateKeyPath.isEmpty()) {
+        const QString sshpassPath = QStandardPaths::findExecutable("sshpass");
+        if (sshpassPath.isEmpty()) {
+            setError("Для legacy-подключения по паролю нужен установленный sshpass");
+            return false;
+        }
+        environment.insert("SSHPASS", m_password);
+        executable = sshpassPath;
+        arguments.prepend(sftpPath);
+        arguments.prepend("-e");
+    }
+    process.setProcessEnvironment(environment);
+    process.setProgram(executable);
+    process.setArguments(arguments);
+    process.start();
+    if (!process.waitForStarted(5000)) {
+        setError(QString("Не удалось запустить OpenSSH sftp: %1").arg(process.errorString()));
+        return false;
+    }
+    QStringList inputCommands = commands;
+    inputCommands << "quit";
+    process.write((inputCommands.join('\n') + '\n').toUtf8());
+    process.closeWriteChannel();
+
+    QElapsedTimer transferTimer;
+    transferTimer.start();
+    qint64 lastReportedSize = -1;
+    QByteArray output;
+    QByteArray errorOutput;
+    while (process.state() != QProcess::NotRunning) {
+        process.waitForReadyRead(250);
+        output += process.readAllStandardOutput();
+        errorOutput += process.readAllStandardError();
+        if (!progressFile.isEmpty()) {
+            const qint64 currentSize = QFileInfo(localProgressPath).size();
+            if (currentSize != lastReportedSize) {
+                emit downloadProgress(progressFile, currentSize, progressTotal);
+                lastReportedSize = currentSize;
+            }
+        }
+        if (transferTimer.elapsed() >= 300000) {
+            process.kill();
+            process.waitForFinished();
+            setError("Операция SFTP прервана: превышено время ожидания (5 минут)");
+            return false;
+        }
+    }
+    output += process.readAllStandardOutput();
+    errorOutput += process.readAllStandardError();
+    if (standardOutput) {
+        *standardOutput = output;
+    }
+    QString details = QString::fromLocal8Bit(errorOutput).trimmed();
+    const QString stdoutText = QString::fromUtf8(output).trimmed();
+    const QRegularExpression operationError(
+        "(Couldn't|Failure|Permission denied|No such file|not found|Connection closed)",
+        QRegularExpression::CaseInsensitiveOption);
+    if (operationError.match(stdoutText).hasMatch()) {
+        details += (details.isEmpty() ? QString() : "\n") + stdoutText;
+    }
+    if (process.exitStatus() != QProcess::NormalExit || process.exitCode() != 0 ||
+        operationError.match(details).hasMatch()) {
+        if (details.isEmpty()) {
+            details = QString("OpenSSH sftp завершился с кодом %1").arg(process.exitCode());
+        }
+        setError(details);
+        return false;
+    }
+    return true;
+}
+
+QString SftpManager::runLegacySshCommand(const QString &command)
+{
+    m_lastError.clear();
+    QString opensslError;
+    const QString opensslConfig = legacySshOpenSslConfigPath(&opensslError);
+    if (!opensslError.isEmpty()) {
+        setError(opensslError);
+        return {};
+    }
+
+    const QString sshPath = QStandardPaths::findExecutable("ssh");
+    if (sshPath.isEmpty()) {
+        setError("Не найден системный клиент OpenSSH ssh");
+        return {};
+    }
+
+    QStringList sshArguments;
+    sshArguments << "-p" << QString::number(m_port);
+    for (const QString &option : legacySshOptions()) {
+        sshArguments << option;
+    }
+    sshArguments << "-o" << "StrictHostKeyChecking=accept-new";
+    sshArguments << "-o" << "NumberOfPasswordPrompts=1";
+    sshArguments << "-o" << "BatchMode=no";
+    if (!m_privateKeyPath.isEmpty()) {
+        sshArguments << "-i" << m_privateKeyPath;
+    }
+    const bool usePasswordAuthentication = !m_password.isEmpty() && m_privateKeyPath.isEmpty();
+    if (usePasswordAuthentication) {
+        sshArguments << "-o" << "PreferredAuthentications=password,keyboard-interactive";
+        sshArguments << "-o" << "PubkeyAuthentication=no";
+    }
+    sshArguments << (m_user + "@" + m_host) << command;
+
+    QProcess process;
+    QProcessEnvironment environment = QProcessEnvironment::systemEnvironment();
+    if (!opensslConfig.isEmpty()) {
+        environment.insert("OPENSSL_CONF", opensslConfig);
+    }
+    QString executable = sshPath;
+    if (!m_password.isEmpty() && m_privateKeyPath.isEmpty()) {
+        const QString sshpassPath = QStandardPaths::findExecutable("sshpass");
+        if (sshpassPath.isEmpty()) {
+            setError("Для legacy-подключения по паролю нужен установленный sshpass");
+            return {};
+        }
+        environment.insert("SSHPASS", m_password);
+        executable = sshpassPath;
+        sshArguments.prepend(sshPath);
+        sshArguments.prepend("-e");
+    }
+    process.setProcessEnvironment(environment);
+    process.setProgram(executable);
+    process.setArguments(sshArguments);
+    process.start();
+    if (!process.waitForStarted(5000)) {
+        setError(QString("Не удалось запустить OpenSSH ssh: %1").arg(process.errorString()));
+        return {};
+    }
+    QElapsedTimer commandTimer;
+    commandTimer.start();
+    QByteArray output;
+    QByteArray errorOutput;
+    while (process.state() != QProcess::NotRunning) {
+        process.waitForReadyRead(250);
+        output += process.readAllStandardOutput();
+        errorOutput += process.readAllStandardError();
+        if (commandTimer.elapsed() >= 300000) {
+            process.kill();
+            process.waitForFinished();
+            setError("SSH-команда прервана: превышено время ожидания (5 минут)");
+            return {};
+        }
+    }
+
+    output += process.readAllStandardOutput();
+    errorOutput += process.readAllStandardError();
+    const QString errorText = QString::fromLocal8Bit(errorOutput).trimmed();
+    if (process.exitStatus() != QProcess::NormalExit || process.exitCode() != 0) {
+        setError(errorText.isEmpty()
+                     ? QString("OpenSSH ssh завершился с кодом %1").arg(process.exitCode())
+                     : errorText);
+        return {};
+    }
+    return QString::fromUtf8(output).trimmed();
 }

@@ -34,6 +34,7 @@ private:
     QLineEdit *loginEdit;
     QLineEdit *passwordEdit;  // <-- Вернули поле пароля
     QCheckBox *useKeyCheckBox;
+    QCheckBox *allowLegacyHostKeysCheckBox;
     QLineEdit *keyPathEdit;
     QPushButton *browseKeyButton;
 

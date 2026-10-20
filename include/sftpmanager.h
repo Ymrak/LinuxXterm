@@ -5,6 +5,7 @@
 #include <QString>
 #include <QStringList>
 #include <QDateTime>
+#include <QByteArray>
 #include <libssh2.h>
 #include <libssh2_sftp.h>
 
@@ -25,15 +26,19 @@ public:
     explicit SftpManager(QObject *parent = nullptr);
     ~SftpManager();
 
-    // Подключение к SFTP через существующую libssh2 сессию или напрямую
+    // Подключение к SFTP
     bool connectToHost(const QString &host, int port, const QString &user, 
-                       const QString &password, const QString &privateKeyPath = QString());
+                       const QString &password, const QString &privateKeyPath = QString(),
+                       bool allowLegacyHostKeys = false);
     
     void disconnect();
     bool isConnected() const { return m_isConnected; }
 
     // Получить домашнюю директорию пользователя через SSH
     QString getHomeDirectory();
+
+    // Выполнить произвольную команду через SSH и вернуть вывод
+    QString executeCommand(const QString &command);
 
     // Операции с файлами
     QList<SftpFileInfo> listDirectory(const QString &remotePath);
@@ -50,6 +55,11 @@ signals:
     void disconnected();
     void errorOccurred(const QString &message);
     void directoryListed(const QString &path, const QList<SftpFileInfo> &files);
+    
+    // Сигналы прогресса для загрузки/скачивания
+    void uploadProgress(const QString &fileName, qint64 bytesSent, qint64 bytesTotal);
+    void downloadProgress(const QString &fileName, qint64 bytesReceived, qint64 bytesTotal);
+    void operationFinished(const QString &fileName, bool success);
 
 private:
     LIBSSH2_SESSION *m_session;
@@ -57,9 +67,22 @@ private:
     int m_socket;
     bool m_isConnected;
     QString m_lastError;
+    bool m_legacyMode = false;
+    QString m_host;
+    int m_port = 22;
+    QString m_user;
+    QString m_password;
+    QString m_privateKeyPath;
+    bool m_allowLegacyHostKeys = false;
+    QString m_homeDirectory;
 
-    // Внутренний метод для установки ошибки
     void setError(const QString &error);
+    bool runLegacySftpBatch(const QStringList &commands, QByteArray *standardOutput = nullptr,
+                            const QString &progressFile = QString(),
+                            const QString &localProgressPath = QString(),
+                            qint64 progressTotal = -1);
+    QString runLegacySshCommand(const QString &command);
+    static QString quoteSftpArgument(const QString &argument);
 };
 
 #endif // SFTPMANAGER_H
