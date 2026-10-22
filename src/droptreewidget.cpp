@@ -97,8 +97,6 @@ void DropTreeWidget::startDragWithLocalFiles(const QStringList &localPaths)
     
     qDebug() << "DropTreeWidget::startDragWithLocalFiles: перетаскивание завершено, действие:" << dropAction;
     
-    // НЕ удаляем файлы здесь! Они нужны для асинхронной передачи под Wayland
-    // Файлы будут удалены при следующем перетаскивании или закрытии приложения
 }
 
 void DropTreeWidget::dragEnterEvent(QDragEnterEvent *event)

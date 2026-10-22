@@ -32,7 +32,7 @@ void MasterPasswordDialog::setupUi()
 
     confirmEdit = new QLineEdit(this);
     confirmEdit->setEchoMode(QLineEdit::Password);
-    confirmEdit->setVisible(false); // Скрыто по умолчанию
+    confirmEdit->setVisible(false);
     formLayout->addRow("Подтверждение:", confirmEdit);
 
     mainLayout->addLayout(formLayout);

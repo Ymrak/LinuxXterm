@@ -2,6 +2,8 @@
 #define PASSWORDMANAGER_H
 
 #include <QObject>
+#include <QByteArray>
+#include <QJsonObject>
 #include <QString>
 #include <QMap>
 
@@ -13,34 +15,25 @@ public:
     explicit PasswordManager(QObject *parent = nullptr);
     ~PasswordManager();
 
-    // Проверка наличия мастер-пароля (установлен ли он)
     bool hasMasterPassword() const;
     
-    // Установка мастер-пароля (первый раз)
     bool setMasterPassword(const QString &password);
     
-    // Проверка мастер-пароля
     bool verifyMasterPassword(const QString &password);
     
-    // Разблокировка хранилища (ввод правильного мастер-пароля)
     bool unlock(const QString &password);
     
-    // Блокировка (очистка из памяти)
     void lock();
     
-    // Проверка разблокировано ли (мастер-пароль в памяти)
     bool isUnlocked() const;
 
-    // Сохранение пароля для подключения
-    void savePassword(const QString &connectionId, const QString &password);
+    bool savePassword(const QString &connectionId, const QString &password);
+    bool savePasswords(const QMap<QString, QString> &passwords);
     
-    // Получение пароля для подключения
     QString getPassword(const QString &connectionId) const;
     
-    // Удаление пароля
     void removePassword(const QString &connectionId);
     
-    // Получение всех ID подключений с паролями
     QStringList getConnectionIds() const;
 
 signals:
@@ -48,18 +41,21 @@ signals:
     void vaultUnlocked();
 
 private:
-    QString encryptPassword(const QString &password) const;
-    QString decryptPassword(const QString &encryptedPassword) const;
-    QString hashPassword(const QString &password) const;
-    void saveVault();
-    bool loadVault();
+    bool encryptPassword(const QString &connectionId, const QString &password,
+                         QJsonObject *record) const;
+    bool decryptPassword(const QString &connectionId, const QJsonObject &record,
+                         QString *password) const;
+    bool saveMasterPasswordHash(const QString &password);
+    bool saveVault();
+    bool loadVault(const QString &password);
 
-    QString m_masterPasswordHash;
-    QString m_masterPassword; // Хранится в памяти только во время работы приложения
+    QByteArray m_masterPasswordHash;
     bool m_isUnlocked;
     QMap<QString, QString> m_passwords;
+    QByteArray m_encryptionKey;
+    QByteArray m_vaultSalt;
     QString m_vaultPath;
     QString m_hashPath;
 };
 
-#endif // PASSWORDMANAGER_H
+#endif

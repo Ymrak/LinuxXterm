@@ -19,16 +19,12 @@ public:
     explicit SshSession(QObject *parent = nullptr);
     ~SshSession();
 
-    // Подключение к серверу
     bool connect(const Connection &connection);
     
-    // Отключение
     void disconnect();
     
-    // Проверка статуса
     bool isConnected() const;
 
-    // Получение указателей на сессии (для использования в других классах)
     LIBSSH2_SESSION* getSession() const;
     LIBSSH2_SFTP* getSftpSession() const;
 
@@ -47,4 +43,4 @@ private:
     bool m_connected;
 };
 
-#endif // SSHSESSION_H
+#endif

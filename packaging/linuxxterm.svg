@@ -1,18 +1,14 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
-  <!-- Фон -->
   <rect width="128" height="128" rx="16" fill="#1a1a2e"/>
   
-  <!-- Терминал -->
   <rect x="20" y="20" width="88" height="88" rx="8" fill="#16213e" stroke="#0f3460" stroke-width="2"/>
   
-  <!-- Заголовок терминала -->
   <rect x="20" y="20" width="88" height="20" rx="8" fill="#0f3460"/>
   <circle cx="32" cy="30" r="4" fill="#e94560"/>
   <circle cx="44" cy="30" r="4" fill="#f39c12"/>
   <circle cx="56" cy="30" r="4" fill="#2ecc71"/>
   
-  <!-- Текст терминала -->
   <text x="28" y="60" font-family="monospace" font-size="14" fill="#2ecc71">$ ssh</text>
   <text x="28" y="80" font-family="monospace" font-size="14" fill="#3498db">user@host</text>
   <text x="28" y="100" font-family="monospace" font-size="14" fill="#ecf0f1">$ _</text>

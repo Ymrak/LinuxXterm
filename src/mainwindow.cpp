@@ -1,6 +1,7 @@
 #include "mainwindow.h"
 #include "logger.h"
 #include "legacyssh.h"
+#include "sshpassproxy.h"
 #include <QApplication>
 #include <QVBoxLayout>
 #include <QHBoxLayout>
@@ -23,6 +24,8 @@
 #include <QStyle>
 #include <QMimeData>
 #include <QProcessEnvironment>
+#include <QLocalServer>
+#include <QLocalSocket>
 #include <QDragEnterEvent>
 #include <QDropEvent>
 #include <QProgressBar>
@@ -120,20 +123,17 @@ void MainWindow::setupUi()
     leftPanelTabs->setMinimumWidth(250);
     leftPanelTabs->setMaximumWidth(400);
 
-    // === Вкладка "Подключения" с поиском ===
     connectionsPanelWidget = new QWidget(this);
     QVBoxLayout *connLayout = new QVBoxLayout(connectionsPanelWidget);
     connLayout->setContentsMargins(2, 2, 2, 2);
     connLayout->setSpacing(2);
     
-    // Поисковая строка
     searchLineEdit = new QLineEdit(this);
     searchLineEdit->setPlaceholderText("🔍 Поиск по имени или хосту...");
     searchLineEdit->setClearButtonEnabled(true);
     searchLineEdit->setToolTip("Введите текст для фильтрации списка подключений");
     connLayout->addWidget(searchLineEdit);
     
-    // Дерево подключений
     connectionsTree = new QTreeWidget(this);
     connectionsTree->setHeaderLabels({"Имя", "Хост"});
     connectionsTree->setContextMenuPolicy(Qt::CustomContextMenu);
@@ -141,7 +141,6 @@ void MainWindow::setupUi()
     
     leftPanelTabs->addTab(connectionsPanelWidget, "Подключения");
 
-    // === Вкладка "Файлы" ===
     filePanelWidget = new QWidget(this);
     QVBoxLayout *filePanelLayout = new QVBoxLayout(filePanelWidget);
     filePanelLayout->setContentsMargins(2, 2, 2, 2);
@@ -181,7 +180,6 @@ void MainWindow::setupUi()
     
     leftPanelTabs->addTab(filePanelWidget, "Файлы");
 
-    // Вкладки терминалов
     terminalTabs = new QTabWidget(this);
     terminalTabs->setTabsClosable(true);
     terminalTabs->setMovable(true);
@@ -285,7 +283,7 @@ void MainWindow::replaceTerminalInTab(int index, CustomTermWidget *newTerminal,
     LOG_INFO(QString("Вкладка %1 заменена: %2").arg(index).arg(tabName));
 }
 
-void MainWindow::createTerminal(const QString &program, const QStringList &args, const QString &tabName,
+bool MainWindow::createTerminal(const QString &program, const QStringList &args, const QString &tabName,
                                 bool allowLegacyHostKeys, const QString &sshpassPassword)
 {
     const QString logArgs = args.join(" ");
@@ -294,28 +292,59 @@ void MainWindow::createTerminal(const QString &program, const QStringList &args,
     CustomTermWidget *terminal = new CustomTermWidget(0, this);
     setupTerminalWidget(terminal);
 
-    QProcessEnvironment environment = QProcessEnvironment::systemEnvironment();
+    QString terminalProgram = program;
+    QStringList terminalArgs = args;
+    QLocalServer *passwordServer = nullptr;
+    QString passwordSocketName;
     if (program == "/usr/bin/sshpass" && !sshpassPassword.isEmpty()) {
-        environment.insert("SSHPASS", sshpassPassword);
+        if (sshpassPassword.toUtf8().size() > 1024 * 1024) {
+            showCopyableError(this, "Ошибка подключения", "Пароль превышает допустимую длину.");
+            delete terminal;
+            return false;
+        }
+
+        passwordSocketName = createSshpassProxySocketName();
+        passwordServer = new QLocalServer(terminal);
+        passwordServer->setSocketOptions(QLocalServer::UserAccessOption);
+        if (!passwordServer->listen(passwordSocketName)) {
+            showCopyableError(
+                this,
+                "Ошибка подключения",
+                "Не удалось создать защищённый канал для передачи пароля SSH."
+            );
+            delete terminal;
+            return false;
+        }
+
+        terminalProgram = QCoreApplication::applicationFilePath();
+        QStringList sshpassArguments;
+        int firstSshpassArgument = !args.isEmpty() && args.first() == "-e" ? 1 : 0;
+        for (int i = firstSshpassArgument; i < args.size(); ++i) {
+            sshpassArguments.append(args.at(i));
+        }
+        terminalArgs = makeSshpassProxyArguments(passwordSocketName, program, sshpassArguments);
     }
+
+    QProcessEnvironment environment = QProcessEnvironment::systemEnvironment();
+    environment.remove("SSHPASS");
     if (allowLegacyHostKeys) {
         QString configError;
         const QString opensslConfig = legacySshOpenSslConfigPath(&configError);
         if (opensslConfig.isEmpty() && !configError.isEmpty()) {
             showCopyableError(this, "Ошибка настройки совместимости SSH", configError);
             delete terminal;
-            return;
+            return false;
         }
         if (!opensslConfig.isEmpty()) {
             environment.insert("OPENSSL_CONF", opensslConfig);
         }
     }
-    if (program == "/usr/bin/sshpass" || allowLegacyHostKeys) {
+    if (terminalProgram != program || allowLegacyHostKeys) {
         terminal->setEnvironment(environment.toStringList());
     }
 
-    terminal->setShellProgram(program);
-    terminal->setArgs(args);
+    terminal->setShellProgram(terminalProgram);
+    terminal->setArgs(terminalArgs);
     connect(terminal, &QTermWidget::receivedData, this, [this, terminal](const QString &text) {
         for (auto it = m_terminalTabs.begin(); it != m_terminalTabs.end(); ++it) {
             if (it.value().terminal == terminal) {
@@ -339,6 +368,24 @@ void MainWindow::createTerminal(const QString &program, const QStringList &args,
         }
     });
     terminal->startShellProgram();
+    if (passwordServer) {
+        QLocalSocket *client = waitForSshpassProxy(passwordServer, terminal->getShellPID(), 5000);
+        if (!client || !sendSshpassProxyPassword(client, sshpassPassword)) {
+            passwordServer->close();
+            QLocalServer::removeServer(passwordSocketName);
+            showCopyableError(
+                this,
+                "Ошибка подключения",
+                "Не удалось передать пароль вспомогательному процессу SSH."
+            );
+            delete terminal;
+            return false;
+        }
+        client->disconnectFromServer();
+        passwordServer->close();
+        QLocalServer::removeServer(passwordSocketName);
+        passwordServer->deleteLater();
+    }
     connect(terminal, &QTermWidget::finished, this, &MainWindow::onTerminalProcessFinished);
 
     int index = terminalTabs->addTab(terminal, shortenName(tabName));
@@ -384,6 +431,7 @@ void MainWindow::createTerminal(const QString &program, const QStringList &args,
     });
 
     LOG_INFO(QString("Вкладка создана: индекс %1, имя %2").arg(index).arg(tabName));
+    return true;
 }
 
 void MainWindow::openConnectionInNewTab(const QString &connectionId)
@@ -394,13 +442,18 @@ void MainWindow::openConnectionInNewTab(const QString &connectionId)
         return;
     }
 
+    if ((m_passwordManager->hasMasterPassword() && !m_passwordManager->isUnlocked())
+        || m_connectionManager->hasPlaintextPasswords()) {
+        if (!ensureVaultUnlocked()) {
+            return;
+        }
+        conn = m_connectionManager->getConnection(connectionId);
+    }
+
     LOG_INFO(QString("Открытие подключения в новой вкладке: %1").arg(conn.getName()));
     statusBarWidget->showMessage("Подключение к " + conn.getHost() + "...");
 
     QString password = m_passwordManager->getPassword(conn.getId());
-    if (password.isEmpty()) {
-        password = conn.getPassword();
-    }
     if (password.isEmpty() && !conn.getUseKey()) {
         bool passwordAccepted = false;
         password = QInputDialog::getText(
@@ -449,7 +502,9 @@ void MainWindow::openConnectionInNewTab(const QString &connectionId)
         LOG_INFO("Пароль не найден в хранилище, будет запрошен вручную в терминале");
     }
 
-    createTerminal(program, sshArgs, conn.getName(), conn.getAllowLegacyHostKeys(), password);
+    if (!createTerminal(program, sshArgs, conn.getName(), conn.getAllowLegacyHostKeys(), password)) {
+        return;
+    }
 
     int currentIndex = terminalTabs->currentIndex();
     if (m_terminalTabs.contains(currentIndex)) {
@@ -492,7 +547,6 @@ void MainWindow::openConnectionInNewTab(const QString &connectionId)
                 m_terminalTabs[currentIndex].sftpPath = homeDir;
             }
             refreshSftpDirectory(homeDir);
-            // startCwdMonitoring(currentIndex);  //
         } else {
             refreshSftpDirectory("/");
         }
@@ -789,7 +843,6 @@ void MainWindow::setupConnections()
 
     updateConnectionsList();
 
-    // === ПОИСК ПО ПОДКЛЮЧЕНИЯМ ===
     connect(searchLineEdit, &QLineEdit::textChanged, this, &MainWindow::filterConnections);
 
     connect(connectionsTree, &QTreeWidget::itemDoubleClicked, this, [this](QTreeWidgetItem *item, int column) {
@@ -968,7 +1021,6 @@ void MainWindow::reindexTerminalTabs()
     m_terminalTabs = reindexed;
 }
 
-// === МЕТОД ФИЛЬТРАЦИИ ПОДКЛЮЧЕНИЙ ===
 void MainWindow::filterConnections(const QString &searchText)
 {
     QString search = searchText.trimmed().toLower();
@@ -980,12 +1032,10 @@ void MainWindow::filterConnections(const QString &searchText)
         QString name = item->text(0).toLower();
         QString host = item->text(1).toLower();
         
-        // Показываем элемент, если поиск пустой ИЛИ имя/хост содержат подстроку
         bool matches = search.isEmpty() || name.contains(search) || host.contains(search);
         item->setHidden(!matches);
     }
     
-    // Обновляем счётчик в статусной строке
     int visibleCount = 0;
     int totalCount = connectionsTree->topLevelItemCount();
     for (int i = 0; i < totalCount; ++i) {
@@ -1304,7 +1354,6 @@ void MainWindow::updateConnectionsList()
         connectionsTree->addTopLevelItem(item);
     }
     
-    // Применяем текущий фильтр, если он есть
     filterConnections(searchLineEdit->text());
 }
 
@@ -1314,15 +1363,20 @@ void MainWindow::onNewConnection()
     ConnectionDialog dialog(this);
     if (dialog.exec() == QDialog::Accepted) {
         Connection newConn = dialog.getConnection();
-        m_connectionManager->addConnection(newConn);
-        
-        if (!newConn.getPassword().isEmpty()) {
-            if (!m_passwordManager->isUnlocked()) ensureVaultUnlocked();
-            if (m_passwordManager->isUnlocked()) {
-                m_passwordManager->savePassword(newConn.getId(), newConn.getPassword());
-                LOG_INFO("Пароль сохранен в хранилище при создании подключения");
+        if (!newConn.getPassword().isEmpty()
+            || m_connectionManager->hasPlaintextPasswords()) {
+            if (!ensureVaultUnlocked()) {
+                return;
             }
         }
+
+        if (!newConn.getPassword().isEmpty()
+            && !m_passwordManager->savePassword(newConn.getId(), newConn.getPassword())) {
+            QMessageBox::critical(this, "Ошибка", "Не удалось безопасно сохранить пароль подключения.");
+            return;
+        }
+        newConn.setPassword(QString());
+        m_connectionManager->addConnection(newConn);
         LOG_INFO(QString("Добавлено подключение: %1").arg(newConn.getName()));
     }
 }
@@ -1338,21 +1392,32 @@ void MainWindow::onEditConnection()
     QString id = item->data(0, Qt::UserRole).toString();
     Connection conn = m_connectionManager->getConnection(id);
 
+    if (((m_passwordManager->hasMasterPassword() && !m_passwordManager->isUnlocked())
+         || m_connectionManager->hasPlaintextPasswords())
+        && !ensureVaultUnlocked()) {
+        return;
+    }
+    conn = m_connectionManager->getConnection(id);
+    conn.setPassword(m_passwordManager->getPassword(id));
+
     ConnectionDialog dialog(this);
     dialog.setConnection(conn);
     
     if (dialog.exec() == QDialog::Accepted) {
         Connection updatedConn = dialog.getConnection();
         updatedConn.setId(id);
-        m_connectionManager->updateConnection(updatedConn);
-        
-        if (!updatedConn.getPassword().isEmpty()) {
-            if (!m_passwordManager->isUnlocked()) ensureVaultUnlocked();
-            if (m_passwordManager->isUnlocked()) {
-                m_passwordManager->savePassword(id, updatedConn.getPassword());
-                LOG_INFO("Пароль обновлен в хранилище");
-            }
+        if (!updatedConn.getPassword().isEmpty()
+            && !m_passwordManager->isUnlocked()
+            && !ensureVaultUnlocked()) {
+            return;
         }
+        if (!updatedConn.getPassword().isEmpty()
+            && !m_passwordManager->savePassword(id, updatedConn.getPassword())) {
+            QMessageBox::critical(this, "Ошибка", "Не удалось безопасно сохранить пароль подключения.");
+            return;
+        }
+        updatedConn.setPassword(QString());
+        m_connectionManager->updateConnection(updatedConn);
         LOG_INFO(QString("Обновлено подключение: %1").arg(updatedConn.getName()));
     }
 }
@@ -1373,33 +1438,58 @@ void MainWindow::onDeleteConnection()
     if (reply == QMessageBox::Yes) {
         QString id = item->data(0, Qt::UserRole).toString();
         QString name = item->text(0);
+        if ((m_passwordManager->hasMasterPassword() && !m_passwordManager->isUnlocked())
+            || m_connectionManager->hasPlaintextPasswords()) {
+            if (!ensureVaultUnlocked()) {
+                return;
+            }
+        }
         m_connectionManager->removeConnection(id);
         m_passwordManager->removePassword(id);
         LOG_INFO(QString("Удалено подключение: %1").arg(name));
     }
 }
 
-void MainWindow::ensureVaultUnlocked()
+bool MainWindow::ensureVaultUnlocked()
 {
-    if (m_passwordManager->isUnlocked()) return;
+    if (!m_passwordManager->isUnlocked()) {
+        MasterPasswordDialog dialog(this);
+        dialog.setMode(m_passwordManager->hasMasterPassword() ? false : true);
 
-    MasterPasswordDialog dialog(this);
-    if (m_passwordManager->hasMasterPassword()) {
-        dialog.setMode(false);
-    } else {
-        dialog.setMode(true);
-    }
+        if (dialog.exec() != QDialog::Accepted) {
+            return false;
+        }
 
-    if (dialog.exec() == QDialog::Accepted) {
-        QString pass = dialog.getMasterPassword();
-        if (m_passwordManager->hasMasterPassword()) {
-            if (!m_passwordManager->unlock(pass)) {
-                QMessageBox::warning(this, "Ошибка", "Неверный мастер-пароль");
-            }
-        } else {
-            m_passwordManager->setMasterPassword(pass);
+        const QString pass = dialog.getMasterPassword();
+        const bool unlocked = m_passwordManager->hasMasterPassword()
+            ? m_passwordManager->unlock(pass)
+            : m_passwordManager->setMasterPassword(pass);
+        if (!unlocked) {
+            QMessageBox::warning(this, "Ошибка", "Не удалось проверить мастер-пароль или открыть хранилище.");
+            return false;
         }
     }
+
+    if (m_connectionManager->hasPlaintextPasswords()) {
+        QMap<QString, QString> legacyPasswords;
+        for (const Connection &connection : m_connectionManager->getConnections()) {
+            if (!connection.getPassword().isEmpty()) {
+                legacyPasswords.insert(connection.getId(), connection.getPassword());
+            }
+        }
+        if (!m_passwordManager->savePasswords(legacyPasswords)
+            || !m_connectionManager->clearPlaintextPasswords()) {
+            QMessageBox::critical(
+                this,
+                "Ошибка миграции",
+                "Не удалось безопасно перенести все сохранённые пароли. "
+                "Исходные профили оставлены без изменений."
+            );
+            return false;
+        }
+    }
+
+    return true;
 }
 
 void MainWindow::checkSshpassInstalled()
@@ -1548,7 +1638,7 @@ void MainWindow::onAbout()
 {
     QMessageBox::about(this, "О программе", 
         "<h2>LinuxXterm</h2>"
-        "<p>Версия 1.0.2</p>"
+        "<p>Версия 1.0.3</p>"
         "<p>SSH-терминал и файловый менеджер SFTP для Linux</p>"
         "<p>Автор и издатель: Hellhost</p>"
         "<p>Помощь с разработкой: AI assistant using Copilot SDK in VS Code</p>"
@@ -1556,7 +1646,6 @@ void MainWindow::onAbout()
     );
 }
 
-// ===== SFTP МЕТОДЫ =====
 
 void MainWindow::onSftpError(const QString &message)
 {

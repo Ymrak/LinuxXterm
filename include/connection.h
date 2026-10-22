@@ -12,7 +12,6 @@ public:
                const QString &login = "", const QString &password = "",
                const QString &privateKeyPath = "", bool useKey = false);
 
-    // Геттеры
     QString getId() const;
     QString getName() const;
     QString getHost() const;
@@ -23,7 +22,6 @@ public:
     bool getUseKey() const;
     bool getAllowLegacyHostKeys() const;
 
-    // Сеттеры
     void setId(const QString &id);
     void setName(const QString &name);
     void setHost(const QString &host);
@@ -34,7 +32,6 @@ public:
     void setUseKey(bool useKey);
     void setAllowLegacyHostKeys(bool allow);
 
-    // Сериализация в JSON (пароль теперь НЕ шифруем!)
     QJsonObject toJson() const;
     static Connection fromJson(const QJsonObject &json);
 
@@ -44,7 +41,7 @@ private:
     QString m_host;
     int m_port;
     QString m_login;
-    QString m_password;  // Теперь хранится в открытом виде (используется только для передачи в PasswordManager)
+    QString m_password;
     QString m_privateKeyPath;
     bool m_useKey;
     bool m_allowLegacyHostKeys;
@@ -52,4 +49,4 @@ private:
     static QString generateId();
 };
 
-#endif // CONNECTION_H
+#endif

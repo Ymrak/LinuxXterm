@@ -14,23 +14,20 @@ public:
     explicit ConnectionManager(QObject *parent = nullptr);
     ~ConnectionManager();
 
-    // Загрузка подключений из файла
     void loadConnections();
 
-    // Сохранение подключений в файл
-    void saveConnections();
+    bool saveConnections();
 
-    // Операции со списком
     void addConnection(const Connection &connection);
     void removeConnection(const QString &id);
     void updateConnection(const Connection &connection);
     Connection getConnection(const QString &id) const;
+    bool hasPlaintextPasswords() const;
+    bool clearPlaintextPasswords();
 
-    // Получение всего списка
     QList<Connection> getConnections() const;
 
 signals:
-    // Сигнал об изменении списка (для обновления UI)
     void connectionsChanged();
 
 private:
@@ -41,4 +38,4 @@ private:
     QList<Connection> m_connections;
 };
 
-#endif // CONNECTIONMANAGER_H
+#endif

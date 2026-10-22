@@ -37,4 +37,4 @@ private:
     bool m_dragRequested = false;
 };
 
-#endif // DROPTREEWIDGET_H
+#endif

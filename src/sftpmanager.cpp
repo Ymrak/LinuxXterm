@@ -1,6 +1,8 @@
 #include "sftpmanager.h"
 #include "legacyssh.h"
+#include "sshpassproxy.h"
 #include <QDebug>
+#include <QCoreApplication>
 #include <QFile>
 #include <QFileInfo>
 #include <QDir>
@@ -9,6 +11,8 @@
 #include <QLocale>
 #include <QProcess>
 #include <QProcessEnvironment>
+#include <QLocalServer>
+#include <QLocalSocket>
 #include <QRegularExpression>
 #include <QStandardPaths>
 
@@ -391,7 +395,6 @@ QString SftpManager::executeCommand(const QString &command)
     libssh2_channel_close(channel);
     libssh2_channel_free(channel);
 
-    // Убираем перенос строки в конце
     output = output.trimmed();
     
     qDebug() << "SftpManager: executeCommand('" << command << "') ->" << output;
@@ -528,7 +531,6 @@ bool SftpManager::downloadFile(const QString &remotePath, const QString &localPa
         return false;
     }
 
-    // Получаем размер файла для прогресса
     LIBSSH2_SFTP_ATTRIBUTES attrs{};
     qint64 fileSize = 0;
     if (libssh2_sftp_fstat_ex(sftpHandle, &attrs, 0) == 0 &&
@@ -772,20 +774,29 @@ bool SftpManager::runLegacySftpBatch(const QStringList &commands, QByteArray *st
 
     QProcess process;
     QProcessEnvironment environment = QProcessEnvironment::systemEnvironment();
+    environment.remove("SSHPASS");
     if (!opensslConfig.isEmpty()) {
         environment.insert("OPENSSL_CONF", opensslConfig);
     }
     QString executable = sftpPath;
+    QLocalServer passwordServer;
+    QString passwordSocketName;
     if (!m_password.isEmpty() && m_privateKeyPath.isEmpty()) {
         const QString sshpassPath = QStandardPaths::findExecutable("sshpass");
         if (sshpassPath.isEmpty()) {
             setError("Для legacy-подключения по паролю нужен установленный sshpass");
             return false;
         }
-        environment.insert("SSHPASS", m_password);
-        executable = sshpassPath;
-        arguments.prepend(sftpPath);
-        arguments.prepend("-e");
+        passwordSocketName = createSshpassProxySocketName();
+        passwordServer.setSocketOptions(QLocalServer::UserAccessOption);
+        if (!passwordServer.listen(passwordSocketName)) {
+            setError("Не удалось создать защищённый канал для передачи пароля SFTP");
+            return false;
+        }
+        QStringList sshpassArguments{sftpPath};
+        sshpassArguments.append(arguments);
+        arguments = makeSshpassProxyArguments(passwordSocketName, sshpassPath, sshpassArguments);
+        executable = QCoreApplication::applicationFilePath();
     }
     process.setProcessEnvironment(environment);
     process.setProgram(executable);
@@ -793,7 +804,32 @@ bool SftpManager::runLegacySftpBatch(const QStringList &commands, QByteArray *st
     process.start();
     if (!process.waitForStarted(5000)) {
         setError(QString("Не удалось запустить OpenSSH sftp: %1").arg(process.errorString()));
+        if (!passwordSocketName.isEmpty()) {
+            QLocalServer::removeServer(passwordSocketName);
+        }
         return false;
+    }
+    if (!passwordSocketName.isEmpty()) {
+        QLocalSocket *client = waitForSshpassProxy(&passwordServer, process.processId(), 5000);
+        if (!client) {
+            process.kill();
+            process.waitForFinished();
+            QLocalServer::removeServer(passwordSocketName);
+            setError("Не удалось передать пароль вспомогательному процессу SFTP");
+            return false;
+        }
+        if (!sendSshpassProxyPassword(client, m_password)) {
+            process.kill();
+            process.waitForFinished();
+            QLocalServer::removeServer(passwordSocketName);
+            setError("Не удалось передать пароль вспомогательному процессу SFTP");
+            return false;
+        }
+        if (client) {
+            client->disconnectFromServer();
+        }
+        passwordServer.close();
+        QLocalServer::removeServer(passwordSocketName);
     }
     QStringList inputCommands = commands;
     inputCommands << "quit";
@@ -883,20 +919,29 @@ QString SftpManager::runLegacySshCommand(const QString &command)
 
     QProcess process;
     QProcessEnvironment environment = QProcessEnvironment::systemEnvironment();
+    environment.remove("SSHPASS");
     if (!opensslConfig.isEmpty()) {
         environment.insert("OPENSSL_CONF", opensslConfig);
     }
     QString executable = sshPath;
+    QLocalServer passwordServer;
+    QString passwordSocketName;
     if (!m_password.isEmpty() && m_privateKeyPath.isEmpty()) {
         const QString sshpassPath = QStandardPaths::findExecutable("sshpass");
         if (sshpassPath.isEmpty()) {
             setError("Для legacy-подключения по паролю нужен установленный sshpass");
             return {};
         }
-        environment.insert("SSHPASS", m_password);
-        executable = sshpassPath;
-        sshArguments.prepend(sshPath);
-        sshArguments.prepend("-e");
+        passwordSocketName = createSshpassProxySocketName();
+        passwordServer.setSocketOptions(QLocalServer::UserAccessOption);
+        if (!passwordServer.listen(passwordSocketName)) {
+            setError("Не удалось создать защищённый канал для передачи пароля SSH");
+            return {};
+        }
+        QStringList sshpassArguments{sshPath};
+        sshpassArguments.append(sshArguments);
+        sshArguments = makeSshpassProxyArguments(passwordSocketName, sshpassPath, sshpassArguments);
+        executable = QCoreApplication::applicationFilePath();
     }
     process.setProcessEnvironment(environment);
     process.setProgram(executable);
@@ -904,7 +949,32 @@ QString SftpManager::runLegacySshCommand(const QString &command)
     process.start();
     if (!process.waitForStarted(5000)) {
         setError(QString("Не удалось запустить OpenSSH ssh: %1").arg(process.errorString()));
+        if (!passwordSocketName.isEmpty()) {
+            QLocalServer::removeServer(passwordSocketName);
+        }
         return {};
+    }
+    if (!passwordSocketName.isEmpty()) {
+        QLocalSocket *client = waitForSshpassProxy(&passwordServer, process.processId(), 5000);
+        if (!client) {
+            process.kill();
+            process.waitForFinished();
+            QLocalServer::removeServer(passwordSocketName);
+            setError("Не удалось передать пароль вспомогательному процессу SSH");
+            return {};
+        }
+        if (!sendSshpassProxyPassword(client, m_password)) {
+            process.kill();
+            process.waitForFinished();
+            QLocalServer::removeServer(passwordSocketName);
+            setError("Не удалось передать пароль вспомогательному процессу SSH");
+            return {};
+        }
+        if (client) {
+            client->disconnectFromServer();
+        }
+        passwordServer.close();
+        QLocalServer::removeServer(passwordSocketName);
     }
     QElapsedTimer commandTimer;
     commandTimer.start();

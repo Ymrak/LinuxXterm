@@ -24,38 +24,31 @@ void ConnectionDialog::setupUi()
     QVBoxLayout *mainLayout = new QVBoxLayout(this);
     QFormLayout *formLayout = new QFormLayout();
 
-    // Имя подключения
     nameEdit = new QLineEdit(this);
     nameEdit->setPlaceholderText("Например: Мой сервер");
     formLayout->addRow("Имя:", nameEdit);
 
-    // Хост
     hostEdit = new QLineEdit(this);
     hostEdit->setPlaceholderText("IP-адрес или домен");
     formLayout->addRow("Хост:", hostEdit);
 
-    // Порт
     portSpinBox = new QSpinBox(this);
     portSpinBox->setRange(1, 65535);
     portSpinBox->setValue(22);
     formLayout->addRow("Порт:", portSpinBox);
 
-    // Логин
     loginEdit = new QLineEdit(this);
     loginEdit->setPlaceholderText("Имя пользователя");
     formLayout->addRow("Логин:", loginEdit);
 
-    // Пароль
     passwordEdit = new QLineEdit(this);
     passwordEdit->setEchoMode(QLineEdit::Password);
     passwordEdit->setPlaceholderText("Пароль (сохранится в защищенном хранилище)");
     formLayout->addRow("Пароль:", passwordEdit);
 
-    // Чекбокс использования ключа
     useKeyCheckBox = new QCheckBox("Использовать приватный ключ SSH", this);
     formLayout->addRow(useKeyCheckBox);
 
-    // Путь к ключу + кнопка Обзор
     QHBoxLayout *keyLayout = new QHBoxLayout();
     keyPathEdit = new QLineEdit(this);
     keyPathEdit->setPlaceholderText("Путь к файлу ключа");
@@ -78,7 +71,6 @@ void ConnectionDialog::setupUi()
 
     mainLayout->addLayout(formLayout);
 
-    // Кнопки ОК и Отмена
     buttonBox = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, this);
     mainLayout->addWidget(buttonBox);
 }
@@ -88,12 +80,10 @@ void ConnectionDialog::setupConnections()
     connect(buttonBox, &QDialogButtonBox::accepted, this, &QDialog::accept);
     connect(buttonBox, &QDialogButtonBox::rejected, this, &QDialog::reject);
 
-    // Переключение полей при изменении чекбокса
     connect(useKeyCheckBox, &QCheckBox::toggled, passwordEdit, &QLineEdit::setDisabled);
     connect(useKeyCheckBox, &QCheckBox::toggled, keyPathEdit, &QLineEdit::setEnabled);
     connect(useKeyCheckBox, &QCheckBox::toggled, browseKeyButton, &QPushButton::setEnabled);
 
-    // Клик по кнопке "Обзор"
     connect(browseKeyButton, &QPushButton::clicked, this, &ConnectionDialog::onBrowseKey);
 }
 

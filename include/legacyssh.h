@@ -7,4 +7,4 @@
 QString legacySshOpenSslConfigPath(QString *errorMessage = nullptr);
 QStringList legacySshOptions();
 
-#endif // LEGACYSSH_H
+#endif

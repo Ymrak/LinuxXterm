@@ -75,7 +75,6 @@ private slots:
     void displayServerMetrics(CustomTermWidget *terminal, const QString &output);
     void onAbout();
     
-    // Поиск по подключениям
     void filterConnections(const QString &searchText);
 
 private:
@@ -86,9 +85,9 @@ private:
     void updateConnectionsList();
     void setupTerminalWidget(CustomTermWidget *terminal);
     void replaceTerminalInTab(int index, CustomTermWidget *newTerminal, const QString &tabName, bool isConnected, const QString &connectionId);
-    void createTerminal(const QString &program, const QStringList &args, const QString &tabName,
+    bool createTerminal(const QString &program, const QStringList &args, const QString &tabName,
                         bool allowLegacyHostKeys = false, const QString &sshpassPassword = QString());
-    void ensureVaultUnlocked();
+    bool ensureVaultUnlocked();
     void checkSshpassInstalled();
     void openConnectionInNewTab(const QString &connectionId);
     QString shortenName(const QString &name);
@@ -105,12 +104,10 @@ private:
     QSplitter *mainSplitter;
     QTabWidget *leftPanelTabs;
     
-    // Вкладка "Подключения" — контейнер с поиском и деревом
     QWidget *connectionsPanelWidget;
     QLineEdit *searchLineEdit;
     QTreeWidget *connectionsTree;
     
-    // Вкладка "Файлы" — контейнер с путём и деревом
     QWidget *filePanelWidget;
     DropTreeWidget *fileTreeWidget;
     QLineEdit *pathLineEdit;
@@ -153,4 +150,4 @@ private:
     QString m_lastKnownCwd;
 };
 
-#endif // MAINWINDOW_H
+#endif

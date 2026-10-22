@@ -25,9 +25,8 @@ private:
     QMutex m_mutex;
 };
 
-// Макросы для удобного логирования
 #define LOG_MSG(msg) Logger::instance().log(msg)
 #define LOG_ERR(msg) Logger::instance().error(msg)
 #define LOG_INFO(msg) Logger::instance().info(msg)
 
-#endif // LOGGER_H
+#endif

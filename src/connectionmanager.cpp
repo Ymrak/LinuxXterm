@@ -6,6 +6,7 @@
 #include <QDir>
 #include <QStandardPaths>
 #include <QDebug>
+#include <QSaveFile>
 
 ConnectionManager::ConnectionManager(QObject *parent)
     : QObject(parent)
@@ -15,7 +16,6 @@ ConnectionManager::ConnectionManager(QObject *parent)
 
 ConnectionManager::~ConnectionManager()
 {
-    saveConnections();
 }
 
 QString ConnectionManager::getConfigPath() const
@@ -34,6 +34,8 @@ void ConnectionManager::ensureConfigDirExists()
     if (!dir.exists()) {
         dir.mkpath(".");
     }
+    QFile::setPermissions(getConfigPath(), QFileDevice::ReadOwner | QFileDevice::WriteOwner
+                                               | QFileDevice::ExeOwner);
 }
 
 void ConnectionManager::loadConnections()
@@ -74,7 +76,7 @@ void ConnectionManager::loadConnections()
     emit connectionsChanged();
 }
 
-void ConnectionManager::saveConnections()
+bool ConnectionManager::saveConnections()
 {
     ensureConfigDirExists();
 
@@ -85,17 +87,27 @@ void ConnectionManager::saveConnections()
 
     QJsonDocument doc(array);
     QString filePath = getConnectionsFilePath();
-    QFile file(filePath);
+    QSaveFile file(filePath);
 
     if (!file.open(QIODevice::WriteOnly)) {
         qWarning() << "Не удалось сохранить файл подключений:" << filePath;
-        return;
+        return false;
     }
 
-    file.write(doc.toJson(QJsonDocument::Indented));
-    file.close();
+    const QByteArray data = doc.toJson(QJsonDocument::Indented);
+    if (file.write(data) != data.size()) {
+        file.cancelWriting();
+        qWarning() << "Не удалось полностью записать файл подключений:" << filePath;
+        return false;
+    }
+    file.setPermissions(QFileDevice::ReadOwner | QFileDevice::WriteOwner);
+    if (!file.commit()) {
+        qWarning() << "Не удалось атомарно сохранить файл подключений:" << filePath;
+        return false;
+    }
 
     qDebug() << "Сохранено подключений:" << m_connections.size();
+    return true;
 }
 
 void ConnectionManager::addConnection(const Connection &connection)
@@ -137,6 +149,29 @@ Connection ConnectionManager::getConnection(const QString &id) const
         }
     }
     return Connection();
+}
+
+bool ConnectionManager::hasPlaintextPasswords() const
+{
+    for (const Connection &connection : m_connections) {
+        if (!connection.getPassword().isEmpty()) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool ConnectionManager::clearPlaintextPasswords()
+{
+    const QList<Connection> previous = m_connections;
+    for (Connection &connection : m_connections) {
+        connection.setPassword(QString());
+    }
+    if (!saveConnections()) {
+        m_connections = previous;
+        return false;
+    }
+    return true;
 }
 
 QList<Connection> ConnectionManager::getConnections() const

@@ -15,7 +15,7 @@ public:
     ~MasterPasswordDialog();
 
     QString getMasterPassword() const;
-    void setMode(bool isNew); // true = создание, false = ввод существующего
+    void setMode(bool isNew);
 
 private:
     void setupUi();
@@ -27,4 +27,4 @@ private:
     bool m_isNew;
 };
 
-#endif // MASTERPASSWORDDIALOG_H
+#endif

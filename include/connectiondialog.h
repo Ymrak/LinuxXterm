@@ -27,19 +27,17 @@ private:
     void setupUi();
     void setupConnections();
 
-    // Поля формы
     QLineEdit *nameEdit;
     QLineEdit *hostEdit;
     QSpinBox *portSpinBox;
     QLineEdit *loginEdit;
-    QLineEdit *passwordEdit;  // <-- Вернули поле пароля
+    QLineEdit *passwordEdit;
     QCheckBox *useKeyCheckBox;
     QCheckBox *allowLegacyHostKeysCheckBox;
     QLineEdit *keyPathEdit;
     QPushButton *browseKeyButton;
 
-    // Кнопки
     QDialogButtonBox *buttonBox;
 };
 
-#endif // CONNECTIONDIALOG_H
+#endif

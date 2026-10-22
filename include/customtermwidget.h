@@ -18,7 +18,7 @@ protected:
     void mouseReleaseEvent(QMouseEvent *event) override;
 
 private slots:
-    void onCopyAvailable(bool available);  // оставим слот, но не будем его использовать
+    void onCopyAvailable(bool available);
 };
 
-#endif // CUSTOMTERMWIDGET_H
+#endif

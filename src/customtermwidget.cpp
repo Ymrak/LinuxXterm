@@ -7,12 +7,9 @@
 CustomTermWidget::CustomTermWidget(int startnow, QWidget *parent)
     : QTermWidget(startnow, parent)
 {
-    // Фокус и политика контекстного меню
     setFocusPolicy(Qt::StrongFocus);
     setContextMenuPolicy(Qt::DefaultContextMenu);
 
-    // Сигнал copyAvailable больше не подключаем, так как его нет в этой версии
-    // Вместо этого используем mouseReleaseEvent для автокопирования
     qDebug() << "CustomTermWidget: инициализирован";
 }
 
@@ -39,19 +36,14 @@ void CustomTermWidget::contextMenuEvent(QContextMenuEvent *event)
 
 void CustomTermWidget::mouseReleaseEvent(QMouseEvent *event)
 {
-    // Вызываем базовую реализацию для корректной обработки выделения
     QTermWidget::mouseReleaseEvent(event);
 
-    // Если после отпускания кнопки есть выделенный текст, копируем его в системный буфер
     if (!selectedText().isEmpty()) {
         copyClipboard();
-        // qDebug() << "CustomTermWidget: выделение скопировано в Clipboard";
     }
 }
 
-// Слот оставлен для совместимости, но больше не вызывается
 void CustomTermWidget::onCopyAvailable(bool available)
 {
     Q_UNUSED(available);
-    // Ничего не делаем
 }

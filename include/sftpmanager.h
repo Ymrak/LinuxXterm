@@ -9,7 +9,6 @@
 #include <libssh2.h>
 #include <libssh2_sftp.h>
 
-// Структура для хранения информации о файле/папке
 struct SftpFileInfo {
     QString name;
     QString path;
@@ -26,7 +25,6 @@ public:
     explicit SftpManager(QObject *parent = nullptr);
     ~SftpManager();
 
-    // Подключение к SFTP
     bool connectToHost(const QString &host, int port, const QString &user, 
                        const QString &password, const QString &privateKeyPath = QString(),
                        bool allowLegacyHostKeys = false);
@@ -34,20 +32,16 @@ public:
     void disconnect();
     bool isConnected() const { return m_isConnected; }
 
-    // Получить домашнюю директорию пользователя через SSH
     QString getHomeDirectory();
 
-    // Выполнить произвольную команду через SSH и вернуть вывод
     QString executeCommand(const QString &command);
 
-    // Операции с файлами
     QList<SftpFileInfo> listDirectory(const QString &remotePath);
     bool downloadFile(const QString &remotePath, const QString &localPath);
     bool uploadFile(const QString &localPath, const QString &remotePath);
     bool deleteFile(const QString &remotePath);
     bool createDirectory(const QString &remotePath);
 
-    // Получение последней ошибки
     QString lastError() const { return m_lastError; }
 
 signals:
@@ -56,7 +50,6 @@ signals:
     void errorOccurred(const QString &message);
     void directoryListed(const QString &path, const QList<SftpFileInfo> &files);
     
-    // Сигналы прогресса для загрузки/скачивания
     void uploadProgress(const QString &fileName, qint64 bytesSent, qint64 bytesTotal);
     void downloadProgress(const QString &fileName, qint64 bytesReceived, qint64 bytesTotal);
     void operationFinished(const QString &fileName, bool success);
@@ -85,4 +78,4 @@ private:
     static QString quoteSftpArgument(const QString &argument);
 };
 
-#endif // SFTPMANAGER_H
+#endif
